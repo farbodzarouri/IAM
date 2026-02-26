@@ -1,0 +1,10 @@
+com/farbod/controller/UserController.class
+com/farbod/service/OtpService.class
+com/farbod/controller/OtpController.class
+com/farbod/repository/UserRepository.class
+com/farbod/IamApplication.class
+com/farbod/config/SecurityConfig.class
+com/farbod/service/UserService.class
+com/farbod/entity/User.class
+com/farbod/service/QrCodeService.class
+com/farbod/controller/WebController.class
