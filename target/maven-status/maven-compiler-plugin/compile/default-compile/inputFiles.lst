@@ -1,0 +1,10 @@
+/app/src/main/java/com/farbod/service/QrCodeService.java
+/app/src/main/java/com/farbod/controller/OtpController.java
+/app/src/main/java/com/farbod/service/OtpService.java
+/app/src/main/java/com/farbod/controller/WebController.java
+/app/src/main/java/com/farbod/config/SecurityConfig.java
+/app/src/main/java/com/farbod/controller/UserController.java
+/app/src/main/java/com/farbod/service/UserService.java
+/app/src/main/java/com/farbod/IamApplication.java
+/app/src/main/java/com/farbod/repository/UserRepository.java
+/app/src/main/java/com/farbod/entity/User.java
