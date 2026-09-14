@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Edit User</title>
+</head>
+<body>
+<h1>Edit User</h1>
+
+<form th:action="@{/users/edit/{id}(id=${user.id})}" method="post">
+    <label>Username:</label>
+    <input type="text" name="username" th:value="${user.username}"/>
+    <label>Password:</label>
+    <input type="password" name="password" th:value="${user.password}"/>
+    <!-- Keep the secret as a hidden field if it exists, so it doesn't get lost on save -->
+    <input type="hidden" name="secret" th:value="${user.secret}"/>
+    
+    <button type="submit">Save Changes</button>
+</form>
+
+<br/>
+<a th:href="@{/users}">Back to Users</a>
+
+</body>
+</html>

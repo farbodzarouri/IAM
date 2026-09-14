@@ -7,7 +7,7 @@
 <h1>User Management</h1>
 
 <h2>Add User</h2>
-<form action="/api/users" method="post">
+<form th:action="@{/users/add}" method="post">
     <label>Username:</label>
     <input type="text" name="username"/>
     <label>Password:</label>
@@ -31,7 +31,7 @@
         <td>
             <a th:href="@{/users/edit/{id}(id=${user.id})}">Edit</a>
             <a th:href="@{/users/{id}/otp(id=${user.id})}">OTP</a>
-            <form th:action="@{/api/users/{id}(id=${user.id})}" th:method="delete">
+            <form th:action="@{/users/delete/{id}(id=${user.id})}" method="post" style="display:inline;">
                 <button type="submit">Delete</button>
             </form>
         </td>

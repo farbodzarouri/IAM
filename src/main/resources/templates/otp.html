@@ -16,7 +16,7 @@
 <div th:if="${user.secret != null}">
     <p>Secret: <strong th:text="${user.secret}">SECRET</strong></p>
     <p>Scan this QR code with Google Authenticator or similar app.</p>
-    <img th:src="@{'data:image/png;base64,' + ${qrCode}}" />
+    <img th:src="@{'data:image/png;base64,' + ${qrCode}}"/>
 
     <h2>Validate OTP</h2>
     <!-- Note: This form submission is for API endpoint which returns JSON. For a real web app we would use AJAX or a web controller endpoint -->
