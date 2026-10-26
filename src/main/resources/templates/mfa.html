@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Remote Desktop MFA</title>
+</head>
+<body>
+<h1>Remote Desktop Gateway - MFA Pre-Authentication</h1>
+<p>Enter your username and the code from your authenticator app, then connect to the Remote Desktop Gateway.</p>
+
+<div th:if="${message != null}">
+    <p th:text="${message}" th:style="${success} ? 'color:green' : 'color:red'">Result</p>
+</div>
+
+<form th:action="@{/mfa}" method="post" autocomplete="off">
+    <div>
+        <label for="username">Username:</label>
+        <input type="text" id="username" name="username" th:value="${username}" required/>
+    </div>
+    <div>
+        <label for="otp">One-time code:</label>
+        <input type="text" id="otp" name="otp" inputmode="numeric" pattern="[0-9 ]*" maxlength="10" required/>
+    </div>
+    <div>
+        <input type="submit" value="Verify"/>
+    </div>
+</form>
+</body>
+</html>

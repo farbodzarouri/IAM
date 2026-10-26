@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.util.OptionalLong;
 
 @Slf4j
 @Primary
@@ -38,18 +39,23 @@ public class TotpServiceImpl implements TotpService {
 
     @Override
     public boolean validateOtp(String secret, int otp) {
+        return findMatchingTimeStep(secret, otp).isPresent();
+    }
+
+    @Override
+    public OptionalLong findMatchingTimeStep(String secret, int otp) {
         if (secret == null || secret.isEmpty() || otp < 0) {
-            return false;
+            return OptionalLong.empty();
         }
 
         long currentBucket = getCurrentBucket();
         for (int i = -CLOCK_DRIFT_WINDOW; i <= CLOCK_DRIFT_WINDOW; i++) {
             long bucket = currentBucket + i;
             if (generateOtp(secret, bucket) == otp) {
-                return true;
+                return OptionalLong.of(bucket);
             }
         }
-        return false;
+        return OptionalLong.empty();
     }
 
     public int generateOtp(String secret, long counter) {

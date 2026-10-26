@@ -32,4 +32,12 @@ public class UserServiceImpl implements UserService {
     public void deleteUser(Long id) {
         userRepository.deleteById(id);
     }
+
+    @Override
+    public List<User> findByUsernameIgnoreCase(String username) {
+        if (username == null || username.isBlank()) {
+            return List.of();
+        }
+        return userRepository.findAllByUsernameIgnoreCase(username);
+    }
 }
