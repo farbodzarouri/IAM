@@ -8,25 +8,32 @@
 
 ## Remote Desktop Gateway MFA (RADIUS)
 
-The service can act as the MFA back-end for Windows Remote Desktop Gateway with NPS in RADIUS-proxy mode.
+The service embeds a RADIUS server (RFC 2865 / RFC 3579, JDK only) supporting both **In-Band Two-Step Challenge/Response** and **Out-of-Band Web/REST Pre-Authentication** for Windows Remote Desktop Gateway (NPS):
 
+### 1. In-Band Challenge/Response Mode (PAP + OTP)
+1. NPS forwards an `Access-Request` (PAP) with `User-Name` and the user's primary password in `User-Password`. The password is verified against the user database. On success an `Access-Challenge` (Code 11) is returned carrying an opaque, single-use 256-bit `State`, a `Reply-Message` prompt, and `Session-Timeout`.
+2. The client answers with a second `Access-Request` containing the same `User-Name`, the `State`, and the 6-digit TOTP code in `User-Password`. A valid code yields `Access-Accept` (Code 2); any invalid, expired, or replayed token yields `Access-Reject` (Code 3).
+
+### 2. Out-of-Band Pre-Authentication Mode
 1. Before connecting, the user pre-authenticates with their OTP (no login required):
    - Web form: `GET /mfa`, `POST /mfa` (form fields `username`, `otp`)
    - REST: `POST /v1/api/mfa/preauth` with `{"username": "jdoe", "otp": 123456}` → `true` / `false`
-2. After AD validates the primary credentials, NPS forwards an Access-Request over UDP. The server replies
-   Access-Accept only if the user has an active, unconsumed approval, which is then consumed (single use).
+2. When NPS forwards an `Access-Request` carrying `User-Name` (without `User-Password`), the server replies `Access-Accept` only if the user holds an active, unconsumed approval, which is consumed atomically.
 
-Security behaviour:
-- Access-Requests must include a valid Message-Authenticator (RFC 3579); other packets are silently discarded.
-- Replies carry a Response Authenticator and Message-Authenticator, and echo Proxy-State attributes.
-- Retransmissions get the cached reply (they never consume a second approval). Replayed Request Authenticators are dropped.
-- An OTP time step can only be used once per user. Repeated failures lock the user out of pre-auth for 15 minutes.
-- User names are matched case-insensitively, and `DOMAIN\user` / `user@realm` forms are normalised.
+### Configuration Properties
 
 | Property | Default | Description |
 |---|---|---|
 | `radius.port` | `1812` | UDP port (`0` = ephemeral) |
-| `radius.shared-secret` | `secret` | Shared secret configured on NPS (change it!) |
-| `radius.mfa.ttl-seconds` | `60` | Lifetime of an MFA approval |
-| `radius.bind-address` | `0.0.0.0` | Interface to bind |
-| `radius.allowed-clients` | *(empty = any)* | Comma-separated NPS IPs allowed to send requests |
+| `radius.shared-secret` | `secret` | Shared secret configured on NPS (change in production) |
+| `radius.mfa.ttl-seconds` | `60` | Lifetime of an out-of-band MFA pre-auth approval |
+| `radius.challenge.ttl-seconds` | `60` | Lifetime of an in-band OTP challenge (`State`) |
+| `radius.enabled` | `true` | Enable/disable the RADIUS listener |
+| `radius.bind-address` | `0.0.0.0` | Local address to bind |
+| `radius.allowed-clients` | *(any)* | Comma-separated NAS/NPS addresses allowed to send requests |
+| `radius.require-message-authenticator` | `false` | Drop requests lacking `Message-Authenticator` |
+| `radius.strip-realm` | `true` | Also match `DOMAIN\user` and `user@domain` as `user` (case-insensitive) |
+| `radius.max-failures` / `radius.lockout-seconds` | `5` / `300` | Per-user failure lockout policy |
+| `radius.duplicate-cache-seconds` | `30` | Retransmission deduplication window |
+| `radius.challenge.max-pending` | `10000` | Maximum outstanding challenges |
+| `radius.challenge.prompt` | `Enter your one-time passcode` | Challenge `Reply-Message` |

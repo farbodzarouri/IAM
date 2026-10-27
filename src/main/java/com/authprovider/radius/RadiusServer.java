@@ -1,8 +1,6 @@
 package com.authprovider.radius;
 
-import com.authprovider.service.MfaPreAuthService;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
@@ -12,148 +10,152 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
-import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
-import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
-import java.util.HexFormat;
-import java.util.LinkedHashMap;
-import java.util.List;
+import java.util.Base64;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * RADIUS authentication server (RFC 2865 / RFC 3579) used as the MFA back-end for
- * Windows NPS acting as a RADIUS proxy for Remote Desktop Gateway.
- * <p>
- * Every Access-Request must carry a valid Message-Authenticator (RFC 3579, BlastRADIUS mitigation).
- * The request is accepted only if the user holds an active, unconsumed MFA pre-authentication
- * approval, which is consumed atomically. Retransmissions (same client, port, identifier and
- * Request Authenticator) are answered with the cached reply so they never consume a second approval
- * nor flip an Accept into a Reject; replays of a known Request Authenticator from a different
- * port/identifier are silently discarded.
- */
+import static com.authprovider.radius.RadiusConstants.*;
+
 @Slf4j
 @Component
 public class RadiusServer implements SmartLifecycle {
 
-    private static final int SOCKET_TIMEOUT_MS = 1000;
-    private static final int MAX_CACHE_ENTRIES = 100_000;
-    private static final Duration MIN_DUPLICATE_WINDOW = Duration.ofSeconds(30);
+    private static final long HOUSEKEEPING_INTERVAL_SECONDS = 5;
 
-    private final MfaPreAuthService mfaPreAuthService;
+    private final RadiusProperties properties;
+    private final RadiusAuthenticationHandler handler;
+    private final RadiusChallengeStore challengeStore;
+    private final RadiusAuthGuard authGuard;
     private final Clock clock;
-    private final String bindAddress;
-    private final int port;
-    private final byte[] sharedSecret;
-    private final Set<InetAddress> allowedClients;
-    private final Duration duplicateWindow;
+    private final Map<String, CachedResponse> responseCache = new ConcurrentHashMap<>();
 
-    /** key: client IP + Request Authenticator, insertion-ordered for cheap expiry. */
-    private final Map<String, CachedResponse> responseCache = new LinkedHashMap<>();
-
-    private volatile DatagramSocket socket;
-    private volatile Thread worker;
     private volatile boolean running;
+    private volatile DatagramSocket socket;
+    private Thread receiver;
+    private ThreadPoolExecutor workers;
+    private ScheduledExecutorService housekeeping;
+    private Set<InetAddress> allowedClients = Set.of();
 
-    private record CachedResponse(int sourcePort, int identifier, byte[] response, Instant expires) {
-    }
-
-    public RadiusServer(MfaPreAuthService mfaPreAuthService,
-                        Clock clock,
-                        @Value("${radius.port:1812}") int port,
-                        @Value("${radius.shared-secret:secret}") String sharedSecret,
-                        @Value("${radius.mfa.ttl-seconds:60}") long ttlSeconds,
-                        @Value("${radius.bind-address:0.0.0.0}") String bindAddress,
-                        @Value("${radius.allowed-clients:}") String allowedClients) {
-        if (port < 0 || port > 65535) {
-            throw new IllegalArgumentException("radius.port out of range: " + port);
-        }
-        if (sharedSecret == null || sharedSecret.isEmpty()) {
-            throw new IllegalArgumentException("radius.shared-secret must not be empty");
-        }
-        if (ttlSeconds <= 0) {
-            throw new IllegalArgumentException("radius.mfa.ttl-seconds must be positive");
-        }
-        this.mfaPreAuthService = mfaPreAuthService;
+    public RadiusServer(RadiusProperties properties, RadiusAuthenticationHandler handler,
+                        RadiusChallengeStore challengeStore, RadiusAuthGuard authGuard, Clock clock) {
+        this.properties = properties;
+        this.handler = handler;
+        this.challengeStore = challengeStore;
+        this.authGuard = authGuard;
         this.clock = clock;
-        this.port = port;
-        this.bindAddress = bindAddress;
-        this.sharedSecret = sharedSecret.getBytes(StandardCharsets.UTF_8);
-        this.allowedClients = parseClients(allowedClients);
-        Duration ttl = Duration.ofSeconds(ttlSeconds);
-        this.duplicateWindow = ttl.compareTo(MIN_DUPLICATE_WINDOW) > 0 ? ttl : MIN_DUPLICATE_WINDOW;
-        if ("secret".equals(sharedSecret)) {
-            log.warn("RADIUS is using the default shared secret; set radius.shared-secret to a strong value in production");
-        }
     }
 
-    private static Set<InetAddress> parseClients(String value) {
-        if (value == null || value.isBlank()) {
-            return Set.of();
-        }
-        return Arrays.stream(value.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .map(s -> {
-                    try {
-                        return InetAddress.getByName(s);
-                    } catch (UnknownHostException e) {
-                        throw new IllegalArgumentException("Invalid radius.allowed-clients entry: " + s, e);
-                    }
-                })
-                .collect(Collectors.toUnmodifiableSet());
-    }
+    private static final class CachedResponse {
+        private final int identifier;
+        private final byte[] fingerprint;
+        private final Instant expiresAt;
+        private final CountDownLatch ready = new CountDownLatch(1);
+        private volatile byte[] response;
 
-    // ---------------------------------------------------------------- lifecycle
+        private CachedResponse(int identifier, byte[] fingerprint, Instant expiresAt) {
+            this.identifier = identifier;
+            this.fingerprint = fingerprint;
+            this.expiresAt = expiresAt;
+        }
+    }
 
     @Override
     public synchronized void start() {
         if (running) {
             return;
         }
-        try {
-            DatagramSocket s = new DatagramSocket(null);
-            s.setReuseAddress(true);
-            s.bind(new InetSocketAddress(InetAddress.getByName(bindAddress), port));
-            s.setSoTimeout(SOCKET_TIMEOUT_MS);
-            socket = s;
-        } catch (IOException e) {
-            log.error("Unable to start RADIUS server on {}:{} - RADIUS MFA will be unavailable", bindAddress, port, e);
+        if (!properties.isEnabled()) {
+            log.info("RADIUS server disabled (radius.enabled=false)");
             return;
         }
+        properties.validate();
+        allowedClients = resolveAllowedClients();
+        if (RadiusProperties.DEFAULT_SHARED_SECRET.equals(properties.getSharedSecret())) {
+            log.warn("RADIUS server is using the default shared secret; set radius.shared-secret to a strong value in production");
+        }
+        if (allowedClients.isEmpty()) {
+            log.warn("RADIUS server accepts requests from any client address; consider restricting radius.allowed-clients");
+        }
+
+        DatagramSocket datagramSocket;
+        try {
+            InetAddress bindAddress = properties.getBindAddress() == null || properties.getBindAddress().isBlank()
+                    ? null : InetAddress.getByName(properties.getBindAddress().trim());
+            datagramSocket = new DatagramSocket(null);
+            datagramSocket.setReuseAddress(true);
+            datagramSocket.bind(new InetSocketAddress(bindAddress, properties.getPort()));
+        } catch (IOException e) {
+            log.error("Unable to start RADIUS server on port {}: {}", properties.getPort(), e.getMessage());
+            return;
+        }
+        socket = datagramSocket;
+
+        AtomicInteger workerCounter = new AtomicInteger();
+        workers = new ThreadPoolExecutor(properties.getWorkerThreads(), properties.getWorkerThreads(),
+                0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(properties.getWorkerQueueCapacity()),
+                runnable -> daemon(runnable, "radius-worker-" + workerCounter.incrementAndGet()),
+                new ThreadPoolExecutor.AbortPolicy());
+        housekeeping = Executors.newSingleThreadScheduledExecutor(runnable -> daemon(runnable, "radius-housekeeping"));
+        housekeeping.scheduleWithFixedDelay(this::housekeep, HOUSEKEEPING_INTERVAL_SECONDS,
+                HOUSEKEEPING_INTERVAL_SECONDS, TimeUnit.SECONDS);
+
         running = true;
-        Thread t = new Thread(this::serve, "radius-server-" + getLocalPort());
-        t.setDaemon(true);
-        worker = t;
-        t.start();
-        log.info("RADIUS server listening on {}:{}", bindAddress, getLocalPort());
+        receiver = daemon(this::receiveLoop, "radius-receiver");
+        receiver.start();
+        log.info("RADIUS server listening on {}:{} (challenge TTL {}s)",
+                socket.getLocalAddress().getHostAddress(), socket.getLocalPort(), properties.getChallenge().getTtlSeconds());
     }
 
     @Override
     public synchronized void stop() {
-        running = false;
-        DatagramSocket s = socket;
-        if (s != null) {
-            s.close();
+        if (!running) {
+            return;
         }
-        Thread t = worker;
-        if (t != null && t != Thread.currentThread()) {
+        running = false;
+        DatagramSocket current = socket;
+        if (current != null) {
+            current.close();
+        }
+        if (receiver != null) {
             try {
-                t.join(SOCKET_TIMEOUT_MS * 2L);
+                receiver.join(TimeUnit.SECONDS.toMillis(5));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
-        worker = null;
-        socket = null;
-        synchronized (responseCache) {
-            responseCache.clear();
+        if (workers != null) {
+            workers.shutdown();
+            try {
+                if (!workers.awaitTermination(5, TimeUnit.SECONDS)) {
+                    workers.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                workers.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
         }
+        if (housekeeping != null) {
+            housekeeping.shutdownNow();
+        }
+        responseCache.clear();
         log.info("RADIUS server stopped");
     }
 
@@ -162,141 +164,186 @@ public class RadiusServer implements SmartLifecycle {
         return running;
     }
 
-    /** @return the bound UDP port (useful when radius.port=0), or -1 if not running. */
     public int getLocalPort() {
-        DatagramSocket s = socket;
-        return s == null ? -1 : s.getLocalPort();
+        DatagramSocket current = socket;
+        return current == null ? -1 : current.getLocalPort();
     }
 
-    // ---------------------------------------------------------------- serving
-
-    private void serve() {
-        byte[] buffer = new byte[RadiusPacket.MAX_LENGTH];
+    private void receiveLoop() {
+        byte[] buffer = new byte[MAX_PACKET_LENGTH];
         while (running) {
-            DatagramSocket s = socket;
-            if (s == null) {
-                break;
-            }
             DatagramPacket datagram = new DatagramPacket(buffer, buffer.length);
             try {
-                s.receive(datagram);
-            } catch (SocketTimeoutException e) {
-                purgeExpired(clock.instant());
-                continue;
+                socket.receive(datagram);
             } catch (SocketException e) {
                 if (running) {
                     log.error("RADIUS socket error", e);
                 }
                 break;
             } catch (IOException e) {
-                log.warn("RADIUS receive failed", e);
+                log.warn("RADIUS receive failed: {}", e.getMessage());
+                continue;
+            }
+            byte[] data = Arrays.copyOfRange(datagram.getData(), datagram.getOffset(),
+                    datagram.getOffset() + datagram.getLength());
+            InetSocketAddress source = (InetSocketAddress) datagram.getSocketAddress();
+            try {
+                workers.execute(() -> process(data, source));
+            } catch (RejectedExecutionException e) {
+                log.warn("RADIUS worker queue full; dropping request from {}", source.getAddress().getHostAddress());
+            }
+        }
+    }
+
+    void process(byte[] data, InetSocketAddress source) {
+        InetAddress address = source.getAddress();
+        if (!allowedClients.isEmpty() && !allowedClients.contains(address)) {
+            log.warn("Dropping RADIUS packet from unauthorized client {}", address.getHostAddress());
+            return;
+        }
+        RadiusPacket packet;
+        try {
+            packet = RadiusPacket.decode(data, data.length);
+        } catch (RadiusException e) {
+            log.debug("Dropping malformed RADIUS packet from {}: {}", address.getHostAddress(), e.getMessage());
+            return;
+        }
+        if (packet.getCode() == STATUS_SERVER) {
+            handleSafely(packet, source).ifPresent(response -> send(response, source));
+            return;
+        }
+        if (packet.getCode() != ACCESS_REQUEST) {
+            log.debug("Dropping RADIUS packet with unsupported code {} from {}", packet.getCode(), address.getHostAddress());
+            return;
+        }
+
+        String key = address.getHostAddress() + "|"
+                + Base64.getEncoder().encodeToString(packet.getAuthenticator());
+        byte[] fingerprint = sha256(packet.getRawBytes());
+        Instant now = clock.instant();
+        CachedResponse entry = new CachedResponse(packet.getIdentifier(), fingerprint,
+                now.plus(Duration.ofSeconds(properties.getDuplicateCacheSeconds())));
+
+        CachedResponse existing = responseCache.get(key);
+        if (existing != null && now.isBefore(existing.expiresAt)) {
+            replayCached(existing, packet.getIdentifier(), fingerprint, source);
+            return;
+        }
+        if (responseCache.size() >= properties.getMaxDuplicateCacheEntries()) {
+            purgeResponseCache();
+            if (responseCache.size() >= properties.getMaxDuplicateCacheEntries()) {
+                log.warn("RADIUS duplicate cache full; dropping request from {}", address.getHostAddress());
+                return;
+            }
+        }
+        boolean claimed = existing == null
+                ? responseCache.putIfAbsent(key, entry) == null
+                : responseCache.replace(key, existing, entry);
+        if (!claimed) {
+            CachedResponse winner = responseCache.get(key);
+            if (winner != null) {
+                replayCached(winner, packet.getIdentifier(), fingerprint, source);
+            }
+            return;
+        }
+
+        try {
+            Optional<byte[]> response = handleSafely(packet, source);
+            if (response.isEmpty()) {
+                responseCache.remove(key, entry);
+                return;
+            }
+            entry.response = response.get();
+            send(entry.response, source);
+        } finally {
+            entry.ready.countDown();
+        }
+    }
+
+    private void replayCached(CachedResponse cached, int identifier, byte[] fingerprint, InetSocketAddress source) {
+        if (cached.identifier != identifier || !MessageDigest.isEqual(cached.fingerprint, fingerprint)) {
+            log.warn("Dropping RADIUS packet from {} reusing Request Authenticator with different identifier or content",
+                    source.getAddress().getHostAddress());
+            return;
+        }
+        try {
+            cached.ready.await(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        byte[] response = cached.response;
+        if (response != null) {
+            log.debug("Retransmitting cached RADIUS response for identifier {} to {}", identifier, source);
+            send(response, source);
+        }
+    }
+
+    private Optional<byte[]> handleSafely(RadiusPacket packet, InetSocketAddress source) {
+        try {
+            return handler.handle(packet, source.getAddress());
+        } catch (Exception e) {
+            log.error("Error processing RADIUS request from {}; request discarded", source.getAddress().getHostAddress(), e);
+            return Optional.empty();
+        }
+    }
+
+    private void send(byte[] response, InetSocketAddress destination) {
+        DatagramSocket current = socket;
+        if (current == null || current.isClosed()) {
+            return;
+        }
+        try {
+            current.send(new DatagramPacket(response, response.length, destination));
+        } catch (IOException e) {
+            log.warn("Failed to send RADIUS response to {}: {}", destination, e.getMessage());
+        }
+    }
+
+    private void housekeep() {
+        try {
+            purgeResponseCache();
+            challengeStore.purgeExpired();
+            authGuard.purgeExpired();
+        } catch (Exception e) {
+            log.warn("RADIUS housekeeping failed", e);
+        }
+    }
+
+    private void purgeResponseCache() {
+        Instant now = clock.instant();
+        responseCache.values().removeIf(cached -> !now.isBefore(cached.expiresAt));
+    }
+
+    private Set<InetAddress> resolveAllowedClients() {
+        Set<InetAddress> resolved = new HashSet<>();
+        if (properties.getAllowedClients() == null) {
+            return resolved;
+        }
+        for (String client : properties.getAllowedClients()) {
+            if (client == null || client.isBlank()) {
                 continue;
             }
             try {
-                byte[] response = handle(datagram.getData(), datagram.getOffset(), datagram.getLength(),
-                        datagram.getAddress(), datagram.getPort());
-                if (response != null) {
-                    s.send(new DatagramPacket(response, response.length, datagram.getAddress(), datagram.getPort()));
-                }
-            } catch (Exception e) {
-                // Never let a single bad packet terminate the server.
-                log.warn("Failed to process RADIUS packet from {}", datagram.getAddress(), e);
+                resolved.addAll(Arrays.asList(InetAddress.getAllByName(client.trim())));
+            } catch (UnknownHostException e) {
+                throw new IllegalStateException("Unable to resolve radius.allowed-clients entry: " + client, e);
             }
         }
+        return Set.copyOf(resolved);
     }
 
-    /**
-     * Processes one datagram and returns the encoded reply, or null if the packet must be
-     * silently discarded.
-     */
-    byte[] handle(byte[] data, int offset, int length, InetAddress source, int sourcePort) {
-        if (!allowedClients.isEmpty() && !allowedClients.contains(source)) {
-            log.warn("Discarding RADIUS packet from unauthorised client {}", source.getHostAddress());
-            return null;
-        }
-        RadiusPacket request;
+    private static Thread daemon(Runnable runnable, String name) {
+        Thread thread = new Thread(runnable, name);
+        thread.setDaemon(true);
+        return thread;
+    }
+
+    private static byte[] sha256(byte[] data) {
         try {
-            request = RadiusPacket.decode(data, offset, length);
-        } catch (IllegalArgumentException e) {
-            log.warn("Discarding malformed RADIUS packet from {}: {}", source.getHostAddress(), e.getMessage());
-            return null;
-        }
-        if (request.getCode() != RadiusPacket.ACCESS_REQUEST) {
-            log.debug("Discarding RADIUS packet with unsupported code {} from {}", request.getCode(), source.getHostAddress());
-            return null;
-        }
-        if (request.hasMessageAuthenticator() && !request.verifyRequestMessageAuthenticator(sharedSecret)) {
-            log.warn("Discarding Access-Request from {} with missing or invalid Message-Authenticator",
-                    source.getHostAddress());
-            return null;
-        }
-
-        Instant now = clock.instant();
-        String cacheKey = source.getHostAddress() + '|' + HexFormat.of().formatHex(request.getAuthenticator());
-        synchronized (responseCache) {
-            purgeExpired(now);
-            CachedResponse cached = responseCache.get(cacheKey);
-            if (cached != null) {
-                if (cached.identifier() == request.getIdentifier()) {
-                    log.debug("Retransmitted Access-Request id={} from {}; resending cached reply",
-                            request.getIdentifier(), source.getHostAddress());
-                    return cached.response().clone();
-                }
-                log.warn("Discarding replayed Access-Request from {} (reused Request Authenticator)",
-                        source.getHostAddress());
-                return null;
-            }
-
-            byte[] response = authenticate(request, source);
-            if (responseCache.size() >= MAX_CACHE_ENTRIES) {
-                var it = responseCache.entrySet().iterator();
-                it.next();
-                it.remove();
-            }
-            responseCache.put(cacheKey, new CachedResponse(sourcePort, request.getIdentifier(), response,
-                    now.plus(duplicateWindow)));
-            return response.clone();
-        }
-    }
-
-    private byte[] authenticate(RadiusPacket request, InetAddress source) {
-        String userName = request.getUserName();
-        boolean accept;
-        String reason;
-        if (userName == null || userName.isBlank()) {
-            accept = false;
-            reason = "missing User-Name";
-        } else if (request.getAttribute(RadiusPacket.ATTR_EAP_MESSAGE) != null) {
-            // EAP is not supported; RFC 3579 section 2.6.2 requires an Access-Reject.
-            accept = false;
-            reason = "EAP not supported";
-        } else if (mfaPreAuthService.consumeApproval(userName)) {
-            accept = true;
-            reason = "MFA approval consumed";
-        } else {
-            accept = false;
-            reason = "no active MFA approval";
-        }
-        log.info("RADIUS {} for user '{}' from {} ({})", accept ? "Access-Accept" : "Access-Reject",
-                userName, source.getHostAddress(), reason);
-        List<RadiusPacket.Attribute> attrs = accept
-                ? List.of()
-                : List.of(new RadiusPacket.Attribute(RadiusPacket.ATTR_REPLY_MESSAGE,
-                "MFA pre-authentication required".getBytes(StandardCharsets.UTF_8)));
-        return RadiusPacket.encodeResponse(accept ? RadiusPacket.ACCESS_ACCEPT : RadiusPacket.ACCESS_REJECT,
-                request, attrs, sharedSecret);
-    }
-
-    private void purgeExpired(Instant now) {
-        synchronized (responseCache) {
-            var it = responseCache.values().iterator();
-            while (it.hasNext()) {
-                if (!now.isBefore(it.next().expires())) {
-                    it.remove();
-                } else {
-                    break; // insertion-ordered with constant window => remaining entries are newer
-                }
-            }
+            return MessageDigest.getInstance("SHA-256").digest(data);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
         }
     }
 }

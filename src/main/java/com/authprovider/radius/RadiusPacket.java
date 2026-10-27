@@ -1,64 +1,165 @@
 package com.authprovider.radius;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
-import java.security.GeneralSecurityException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
-/**
- * Minimal RADIUS packet model and codec (RFC 2865 / RFC 3579) built on the JDK only.
- */
+import static com.authprovider.radius.RadiusConstants.*;
+
 public final class RadiusPacket {
 
-    public static final int ACCESS_REQUEST = 1;
-    public static final int ACCESS_ACCEPT = 2;
-    public static final int ACCESS_REJECT = 3;
+    public static final int ACCESS_REQUEST = RadiusConstants.ACCESS_REQUEST;
+    public static final int ACCESS_ACCEPT = RadiusConstants.ACCESS_ACCEPT;
+    public static final int ACCESS_REJECT = RadiusConstants.ACCESS_REJECT;
+    public static final int ACCESS_CHALLENGE = RadiusConstants.ACCESS_CHALLENGE;
 
-    public static final int ATTR_USER_NAME = 1;
-    public static final int ATTR_USER_PASSWORD = 2;
-    public static final int ATTR_CHAP_PASSWORD = 3;
-    public static final int ATTR_REPLY_MESSAGE = 18;
-    public static final int ATTR_PROXY_STATE = 33;
-    public static final int ATTR_EAP_MESSAGE = 79;
-    public static final int ATTR_MESSAGE_AUTHENTICATOR = 80;
+    public static final int ATTR_USER_NAME = RadiusConstants.ATTR_USER_NAME;
+    public static final int ATTR_USER_PASSWORD = RadiusConstants.ATTR_USER_PASSWORD;
+    public static final int ATTR_CHAP_PASSWORD = RadiusConstants.ATTR_CHAP_PASSWORD;
+    public static final int ATTR_REPLY_MESSAGE = RadiusConstants.ATTR_REPLY_MESSAGE;
+    public static final int ATTR_STATE = RadiusConstants.ATTR_STATE;
+    public static final int ATTR_SESSION_TIMEOUT = RadiusConstants.ATTR_SESSION_TIMEOUT;
+    public static final int ATTR_PROXY_STATE = RadiusConstants.ATTR_PROXY_STATE;
+    public static final int ATTR_EAP_MESSAGE = RadiusConstants.ATTR_EAP_MESSAGE;
+    public static final int ATTR_MESSAGE_AUTHENTICATOR = RadiusConstants.ATTR_MESSAGE_AUTHENTICATOR;
 
-    public static final int HEADER_LENGTH = 20;
-    public static final int AUTHENTICATOR_LENGTH = 16;
-    public static final int MIN_LENGTH = 20;
-    public static final int MAX_LENGTH = 4096;
-    private static final int MESSAGE_AUTHENTICATOR_ATTR_LENGTH = 18;
+    public static final int HEADER_LENGTH = RadiusConstants.HEADER_LENGTH;
+    public static final int AUTHENTICATOR_LENGTH = RadiusConstants.AUTHENTICATOR_LENGTH;
+    public static final int MIN_LENGTH = RadiusConstants.MIN_PACKET_LENGTH;
+    public static final int MAX_LENGTH = RadiusConstants.MAX_PACKET_LENGTH;
 
-    /** A single RADIUS attribute (type + raw value). */
-    public record Attribute(int type, byte[] value) {
-        public Attribute {
-            if (type < 1 || type > 255) {
-                throw new IllegalArgumentException("Invalid attribute type " + type);
-            }
-            if (value == null || value.length > 253) {
-                throw new IllegalArgumentException("Invalid attribute value length");
-            }
+    public static final class Attribute extends RadiusAttribute {
+        public Attribute(int type, byte[] value) {
+            super(type, value);
         }
     }
 
     private final int code;
     private final int identifier;
     private final byte[] authenticator;
-    private final List<Attribute> attributes;
-    /** Raw bytes as received (trimmed to the Length field); null for locally built packets. */
-    private final byte[] raw;
+    private final List<RadiusAttribute> attributes;
+    private final byte[] rawBytes;
+    private final int messageAuthenticatorOffset;
 
-    private RadiusPacket(int code, int identifier, byte[] authenticator, List<Attribute> attributes, byte[] raw) {
+    private RadiusPacket(int code, int identifier, byte[] authenticator, List<RadiusAttribute> attributes,
+                         byte[] rawBytes, int messageAuthenticatorOffset) {
         this.code = code;
         this.identifier = identifier;
         this.authenticator = authenticator;
         this.attributes = Collections.unmodifiableList(attributes);
-        this.raw = raw;
+        this.rawBytes = rawBytes;
+        this.messageAuthenticatorOffset = messageAuthenticatorOffset;
+    }
+
+    public static RadiusPacket decode(byte[] data, int datagramLength) throws RadiusException {
+        if (data == null || datagramLength < MIN_PACKET_LENGTH || datagramLength > data.length) {
+            throw new RadiusException("Datagram shorter than RADIUS header");
+        }
+        int code = data[0] & 0xFF;
+        int identifier = data[1] & 0xFF;
+        int length = ((data[2] & 0xFF) << 8) | (data[3] & 0xFF);
+        if (length < MIN_PACKET_LENGTH || length > MAX_PACKET_LENGTH) {
+            throw new RadiusException("Invalid RADIUS length field: " + length);
+        }
+        if (length > datagramLength) {
+            throw new RadiusException("Datagram shorter than RADIUS length field");
+        }
+        byte[] raw = Arrays.copyOf(data, length);
+        byte[] authenticator = Arrays.copyOfRange(raw, 4, HEADER_LENGTH);
+
+        List<RadiusAttribute> attributes = new ArrayList<>();
+        int messageAuthenticatorOffset = -1;
+        int pos = HEADER_LENGTH;
+        while (pos < length) {
+            if (pos + 2 > length) {
+                throw new RadiusException("Truncated attribute header");
+            }
+            int type = raw[pos] & 0xFF;
+            int attrLength = raw[pos + 1] & 0xFF;
+            if (attrLength < 2 || pos + attrLength > length) {
+                throw new RadiusException("Invalid attribute length");
+            }
+            if (type == 0) {
+                throw new RadiusException("Invalid attribute type 0");
+            }
+            if (type == ATTR_MESSAGE_AUTHENTICATOR) {
+                if (attrLength != 2 + MESSAGE_AUTHENTICATOR_LENGTH) {
+                    throw new RadiusException("Invalid Message-Authenticator length");
+                }
+                if (messageAuthenticatorOffset >= 0) {
+                    throw new RadiusException("Multiple Message-Authenticator attributes");
+                }
+                messageAuthenticatorOffset = pos + 2;
+            }
+            attributes.add(new Attribute(type, Arrays.copyOfRange(raw, pos + 2, pos + attrLength)));
+            pos += attrLength;
+        }
+        return new RadiusPacket(code, identifier, authenticator, attributes, raw, messageAuthenticatorOffset);
+    }
+
+    public static RadiusPacket decode(byte[] data, int offset, int received) {
+        if (data == null || offset < 0 || received < MIN_PACKET_LENGTH || offset + received > data.length) {
+            throw new IllegalArgumentException("Packet shorter than minimum length");
+        }
+        byte[] slice = offset == 0 ? data : Arrays.copyOfRange(data, offset, offset + received);
+        try {
+            return decode(slice, received);
+        } catch (RadiusException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
+    }
+
+    public static byte[] encode(int code, int identifier, byte[] authenticator, List<? extends RadiusAttribute> attributes) {
+        if (authenticator == null || authenticator.length != AUTHENTICATOR_LENGTH) {
+            throw new IllegalArgumentException("Authenticator must be 16 octets");
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(code);
+        out.write(identifier);
+        out.write(0);
+        out.write(0);
+        out.writeBytes(authenticator);
+        for (RadiusAttribute attribute : attributes) {
+            out.write(attribute.getType());
+            out.write(attribute.getValueLength() + 2);
+            out.writeBytes(attribute.getValue());
+        }
+        byte[] bytes = out.toByteArray();
+        if (bytes.length > MAX_PACKET_LENGTH) {
+            throw new IllegalArgumentException("RADIUS packet exceeds maximum length");
+        }
+        bytes[2] = (byte) (bytes.length >> 8);
+        bytes[3] = (byte) bytes.length;
+        return bytes;
+    }
+
+    public static byte[] encodeAccessRequest(int identifier, byte[] requestAuthenticator,
+                                             List<? extends RadiusAttribute> attributes, byte[] secret,
+                                             boolean includeMessageAuthenticator) {
+        return RadiusCrypto.buildRequest(ACCESS_REQUEST, identifier, requestAuthenticator, attributes, secret, includeMessageAuthenticator);
+    }
+
+    public static byte[] encodeResponse(int code, RadiusPacket request, List<? extends RadiusAttribute> attributes, byte[] secret) {
+        List<RadiusAttribute> all = new ArrayList<>(attributes);
+        all.addAll(request.getAttributes(ATTR_PROXY_STATE));
+        return RadiusCrypto.buildResponse(code, request.getIdentifier(), request.getAuthenticator(), all, secret);
+    }
+
+    public static boolean verifyResponse(byte[] response, int responseLength, byte[] requestAuthenticator, byte[] secret) {
+        try {
+            RadiusPacket decoded = decode(response, responseLength);
+            return RadiusCrypto.verifyResponse(decoded, requestAuthenticator, secret);
+        } catch (RadiusException e) {
+            return false;
+        }
+    }
+
+    public boolean verifyRequestMessageAuthenticator(byte[] secret) {
+        return RadiusCrypto.verifyRequestMessageAuthenticator(this, secret);
     }
 
     public int getCode() {
@@ -73,243 +174,61 @@ public final class RadiusPacket {
         return authenticator.clone();
     }
 
-    public List<Attribute> getAttributes() {
+    public List<RadiusAttribute> getAttributes() {
         return attributes;
     }
 
-    public List<Attribute> getAttributes(int type) {
-        List<Attribute> result = new ArrayList<>();
-        for (Attribute a : attributes) {
-            if (a.type() == type) {
-                result.add(a);
+    public List<RadiusAttribute> getAttributes(int type) {
+        List<RadiusAttribute> result = new ArrayList<>();
+        for (RadiusAttribute attribute : attributes) {
+            if (attribute.getType() == type) {
+                result.add(attribute);
             }
         }
         return result;
     }
 
-    public Attribute getAttribute(int type) {
-        for (Attribute a : attributes) {
-            if (a.type() == type) {
-                return a;
+    public RadiusAttribute getAttribute(int type) {
+        for (RadiusAttribute attribute : attributes) {
+            if (attribute.getType() == type) {
+                return attribute;
             }
         }
         return null;
     }
 
+    public Optional<RadiusAttribute> findAttribute(int type) {
+        return Optional.ofNullable(getAttribute(type));
+    }
+
     public String getUserName() {
-        Attribute a = getAttribute(ATTR_USER_NAME);
-        return a == null ? null : new String(a.value(), StandardCharsets.UTF_8);
+        RadiusAttribute a = getAttribute(ATTR_USER_NAME);
+        return a == null ? null : new String(a.getValue(), StandardCharsets.UTF_8);
     }
 
-    /**
-     * Parses a datagram. Throws {@link IllegalArgumentException} for malformed packets which,
-     * per RFC 2865 section 3, must be silently discarded.
-     */
-    public static RadiusPacket decode(byte[] data, int offset, int received) {
-        if (received < MIN_LENGTH) {
-            throw new IllegalArgumentException("Packet shorter than minimum length");
-        }
-        int length = ((data[offset + 2] & 0xff) << 8) | (data[offset + 3] & 0xff);
-        if (length < MIN_LENGTH || length > MAX_LENGTH) {
-            throw new IllegalArgumentException("Invalid length field " + length);
-        }
-        if (length > received) {
-            throw new IllegalArgumentException("Packet truncated");
-        }
-        // Octets beyond the Length field are padding and MUST be ignored.
-        byte[] raw = new byte[length];
-        System.arraycopy(data, offset, raw, 0, length);
-
-        int code = raw[0] & 0xff;
-        int identifier = raw[1] & 0xff;
-        byte[] authenticator = new byte[AUTHENTICATOR_LENGTH];
-        System.arraycopy(raw, 4, authenticator, 0, AUTHENTICATOR_LENGTH);
-
-        List<Attribute> attributes = new ArrayList<>();
-        int pos = HEADER_LENGTH;
-        while (pos < length) {
-            if (pos + 2 > length) {
-                throw new IllegalArgumentException("Truncated attribute header");
+    public int countAttributes(int type) {
+        int count = 0;
+        for (RadiusAttribute attribute : attributes) {
+            if (attribute.getType() == type) {
+                count++;
             }
-            int type = raw[pos] & 0xff;
-            int attrLen = raw[pos + 1] & 0xff;
-            if (type == 0 || attrLen < 2 || pos + attrLen > length) {
-                throw new IllegalArgumentException("Malformed attribute");
-            }
-            byte[] value = new byte[attrLen - 2];
-            System.arraycopy(raw, pos + 2, value, 0, value.length);
-            attributes.add(new Attribute(type, value));
-            pos += attrLen;
         }
-        return new RadiusPacket(code, identifier, authenticator, attributes, raw);
+        return count;
     }
 
-    /**
-     * Verifies the Message-Authenticator (RFC 3579 section 3.2) of a received Access-Request.
-     *
-     * @return true only if exactly one well-formed Message-Authenticator is present and valid
-     */
-    public boolean verifyRequestMessageAuthenticator(byte[] secret) {
-        if (raw == null) {
-            throw new IllegalStateException("Only received packets can be verified");
-        }
-        int found = -1;
-        int pos = HEADER_LENGTH;
-        while (pos < raw.length) {
-            int type = raw[pos] & 0xff;
-            int attrLen = raw[pos + 1] & 0xff;
-            if (type == ATTR_MESSAGE_AUTHENTICATOR) {
-                if (found >= 0 || attrLen != MESSAGE_AUTHENTICATOR_ATTR_LENGTH) {
-                    return false;
-                }
-                found = pos;
-            }
-            pos += attrLen;
-        }
-        if (found < 0) {
-            return false;
-        }
-        byte[] copy = raw.clone();
-        byte[] received = new byte[16];
-        System.arraycopy(copy, found + 2, received, 0, 16);
-        java.util.Arrays.fill(copy, found + 2, found + 18, (byte) 0);
-        byte[] expected = hmacMd5(secret, copy);
-        return MessageDigest.isEqual(expected, received);
+    public byte[] getRawBytes() {
+        return rawBytes.clone();
     }
 
     public boolean hasMessageAuthenticator() {
-        return getAttribute(ATTR_MESSAGE_AUTHENTICATOR) != null;
+        return messageAuthenticatorOffset >= 0;
     }
 
-    /**
-     * Builds an encoded response (Access-Accept / Access-Reject) to the given request.
-     * A Message-Authenticator is placed first, followed by the supplied attributes and
-     * all Proxy-State attributes copied unmodified and in order from the request (RFC 2865 5.33).
-     */
-    public static byte[] encodeResponse(int code, RadiusPacket request, List<Attribute> attributes, byte[] secret) {
-        ByteArrayOutputStream attrs = new ByteArrayOutputStream();
-        attrs.write(ATTR_MESSAGE_AUTHENTICATOR);
-        attrs.write(MESSAGE_AUTHENTICATOR_ATTR_LENGTH);
-        int messageAuthOffset = HEADER_LENGTH + 2;
-        attrs.writeBytes(new byte[16]);
-        for (Attribute a : attributes) {
-            writeAttribute(attrs, a);
-        }
-        for (Attribute a : request.getAttributes(ATTR_PROXY_STATE)) {
-            writeAttribute(attrs, a);
-        }
-        byte[] attrBytes = attrs.toByteArray();
-        int length = HEADER_LENGTH + attrBytes.length;
-        if (length > MAX_LENGTH) {
-            throw new IllegalArgumentException("Response too large");
-        }
-        byte[] packet = new byte[length];
-        packet[0] = (byte) code;
-        packet[1] = (byte) request.getIdentifier();
-        packet[2] = (byte) (length >> 8);
-        packet[3] = (byte) length;
-        // Message-Authenticator for responses uses the Request Authenticator (RFC 3579 3.2).
-        System.arraycopy(request.authenticator, 0, packet, 4, AUTHENTICATOR_LENGTH);
-        System.arraycopy(attrBytes, 0, packet, HEADER_LENGTH, attrBytes.length);
-        byte[] mac = hmacMd5(secret, packet);
-        System.arraycopy(mac, 0, packet, messageAuthOffset, 16);
-        // Response Authenticator = MD5(Code+ID+Length+RequestAuth+Attributes+Secret) (RFC 2865 3).
-        MessageDigest md5 = md5();
-        md5.update(packet);
-        md5.update(secret);
-        System.arraycopy(md5.digest(), 0, packet, 4, AUTHENTICATOR_LENGTH);
-        return packet;
+    int getMessageAuthenticatorOffset() {
+        return messageAuthenticatorOffset;
     }
 
-    /** Builds an encoded Access-Request (used by clients and tests). */
-    public static byte[] encodeAccessRequest(int identifier, byte[] requestAuthenticator,
-                                             List<Attribute> attributes, byte[] secret,
-                                             boolean includeMessageAuthenticator) {
-        ByteArrayOutputStream attrs = new ByteArrayOutputStream();
-        int messageAuthOffset = -1;
-        if (includeMessageAuthenticator) {
-            attrs.write(ATTR_MESSAGE_AUTHENTICATOR);
-            attrs.write(MESSAGE_AUTHENTICATOR_ATTR_LENGTH);
-            attrs.writeBytes(new byte[16]);
-            messageAuthOffset = HEADER_LENGTH + 2;
-        }
-        for (Attribute a : attributes) {
-            writeAttribute(attrs, a);
-        }
-        byte[] attrBytes = attrs.toByteArray();
-        int length = HEADER_LENGTH + attrBytes.length;
-        byte[] packet = new byte[length];
-        packet[0] = (byte) ACCESS_REQUEST;
-        packet[1] = (byte) identifier;
-        packet[2] = (byte) (length >> 8);
-        packet[3] = (byte) length;
-        System.arraycopy(requestAuthenticator, 0, packet, 4, AUTHENTICATOR_LENGTH);
-        System.arraycopy(attrBytes, 0, packet, HEADER_LENGTH, attrBytes.length);
-        if (messageAuthOffset > 0) {
-            System.arraycopy(hmacMd5(secret, packet), 0, packet, messageAuthOffset, 16);
-        }
-        return packet;
-    }
-
-    /**
-     * Verifies a received response against the original request authenticator
-     * (Response Authenticator and, if present, Message-Authenticator).
-     */
-    public static boolean verifyResponse(byte[] response, int responseLength, byte[] requestAuthenticator, byte[] secret) {
-        RadiusPacket p;
-        try {
-            p = decode(response, 0, responseLength);
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
-        byte[] raw = p.raw.clone();
-        byte[] receivedAuth = p.authenticator;
-        System.arraycopy(requestAuthenticator, 0, raw, 4, AUTHENTICATOR_LENGTH);
-        MessageDigest md5 = md5();
-        md5.update(raw);
-        md5.update(secret);
-        if (!MessageDigest.isEqual(md5.digest(), receivedAuth)) {
-            return false;
-        }
-        int pos = HEADER_LENGTH;
-        while (pos < raw.length) {
-            int type = raw[pos] & 0xff;
-            int attrLen = raw[pos + 1] & 0xff;
-            if (type == ATTR_MESSAGE_AUTHENTICATOR) {
-                if (attrLen != MESSAGE_AUTHENTICATOR_ATTR_LENGTH) {
-                    return false;
-                }
-                byte[] received = new byte[16];
-                System.arraycopy(raw, pos + 2, received, 0, 16);
-                java.util.Arrays.fill(raw, pos + 2, pos + 18, (byte) 0);
-                return MessageDigest.isEqual(hmacMd5(secret, raw), received);
-            }
-            pos += attrLen;
-        }
-        return true;
-    }
-
-    private static void writeAttribute(ByteArrayOutputStream out, Attribute a) {
-        out.write(a.type());
-        out.write(a.value().length + 2);
-        out.writeBytes(a.value());
-    }
-
-    static byte[] hmacMd5(byte[] key, byte[] data) {
-        try {
-            Mac mac = Mac.getInstance("HmacMD5");
-            mac.init(new SecretKeySpec(key, "HmacMD5"));
-            return mac.doFinal(data);
-        } catch (GeneralSecurityException e) {
-            throw new IllegalStateException("HmacMD5 unavailable", e);
-        }
-    }
-
-    static MessageDigest md5() {
-        try {
-            return MessageDigest.getInstance("MD5");
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("MD5 unavailable", e);
-        }
+    byte[] rawBytesUnsafe() {
+        return rawBytes;
     }
 }
