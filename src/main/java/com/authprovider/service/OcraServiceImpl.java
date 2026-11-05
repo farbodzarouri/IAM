@@ -7,6 +7,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 
 @Slf4j
 @Primary
@@ -38,7 +39,12 @@ public class OcraServiceImpl implements OcraService {
     @Override
     public boolean validateOcra(String secret, String challenge, String otp) {
         String generated = generateOcra(secret, challenge);
-        return generated != null && generated.equals(otp);
+        if (generated == null || otp == null) {
+            return false;
+        }
+        return MessageDigest.isEqual(
+                generated.getBytes(StandardCharsets.UTF_8),
+                otp.getBytes(StandardCharsets.UTF_8));
     }
 }
 

@@ -20,6 +20,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
     static final int MAX_FAILED_ATTEMPTS = 5;
     static final Duration LOCKOUT_WINDOW = Duration.ofMinutes(15);
     private static final Duration PURGE_INTERVAL = Duration.ofSeconds(30);
+    static final int MAX_FAILURE_ENTRIES = 10000;
 
     private final UserService userService;
     private final TotpService totpService;
@@ -145,6 +146,13 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
     }
 
     private void recordFailure(String key, Instant now) {
+        if (!failures.containsKey(key) && failures.size() >= MAX_FAILURE_ENTRIES) {
+            failures.entrySet().removeIf(e -> !now.isBefore(e.getValue().windowStart().plus(LOCKOUT_WINDOW)));
+            if (failures.size() >= MAX_FAILURE_ENTRIES) {
+                log.warn("Failure cache capacity reached; dropping failure record for '{}'", key);
+                return;
+            }
+        }
         failures.compute(key, (k, w) -> {
             if (w == null || !now.isBefore(w.windowStart().plus(LOCKOUT_WINDOW))) {
                 return new FailureWindow(now, 1);
@@ -160,5 +168,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
         lastPurge = now;
         approvals.entrySet().removeIf(e -> !now.isBefore(e.getValue()));
         failures.entrySet().removeIf(e -> !now.isBefore(e.getValue().windowStart().plus(LOCKOUT_WINDOW)));
+        long currentStep = now.toEpochMilli() / 30000L;
+        lastUsedTimeStep.entrySet().removeIf(e -> e.getValue() < currentStep - 2);
     }
 }

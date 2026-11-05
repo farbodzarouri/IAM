@@ -1,6 +1,7 @@
 package com.authprovider.config;
 
 import org.apache.commons.codec.binary.Base32;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -8,6 +9,7 @@ import java.security.SecureRandom;
 import java.time.Clock;
 
 @Configuration
+@EnableConfigurationProperties(LdapProperties.class)
 public class AppConfig {
 
     @Bean
