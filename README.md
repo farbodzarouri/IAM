@@ -43,7 +43,7 @@ Used when the client (e.g. Windows RD Gateway) forwards an `Access-Request` *wit
 1. Before connecting, the user pre-authenticates their second factor:
    - Web interface: `GET /mfa` → submit username and OTP code.
    - REST endpoint: `POST /v1/api/mfa/preauth` with `{"username": "alice", "otp": 123456}`.
-2. When approved, a single-use approval token is cached for `radius.mfa.ttl-seconds`.
+2. When approved, a single-use approval is persisted (`mfa_approvals`) for the security policy's MFA approval TTL (seeded from `radius.mfa.ttl-seconds`).
 3. When NPS sends an `Access-Request`, the server consumes the active approval and returns `Access-Accept`. If unapproved or expired, it returns `Access-Reject`.
 
 #### Mode B: In-band Challenge-Response (RFC 2865)
@@ -72,7 +72,7 @@ Used when the client submits an `Access-Request` *with* `User-Password`:
 - **Multi-Factor Replay Defense**:
   - Both web login and RADIUS MFA record and invalidate consumed TOTP time-step windows to prevent token reuse during replay attacks.
 - **Denial of Service & Memory Bounds**:
-  - The brute-force failure tracking cache is bounded to 10,000 active records with automatic eviction of expired entries.
+  - The persistent MFA pre-authentication failure tracking is bounded to 10,000 active records with automatic eviction of expired entries.
   - Accepted TOTP time-step records are pruned past the clock-drift window.
 - **Identity Collision**:
   - The user database schema enforces unique constraints on usernames with case-insensitive collision detection during provisioning.
@@ -113,6 +113,35 @@ Used when the client submits an `Access-Request` *with* `User-Password`:
 | `ldap.fallback-to-local` | `false` | Fall back to local DB credentials if user is absent from directory |
 | `ldap.connect-timeout-ms` | `5000` | Socket connection timeout |
 | `ldap.read-timeout-ms` | `10000` | Socket read timeout |
+| `ldap.realm` | *(empty)* | Realm identifier(s), comma separated, routing qualified names to the seeded directory |
+| `ldap.priority` | `100` | Evaluation order of the seeded directory (lower first) |
+
+> The `radius.*` and `ldap.*` properties above are only used to **seed** the database on first start
+> (see below). Once the tables are populated, the persisted records are authoritative.
+
+---
+
+## Persistent Runtime Configuration & State (Clustering / Multi-Tenancy)
+
+All runtime configuration, session tracking, security policy and audit data is stored in the database through
+typed JPA entities, so several nodes can share one database and state survives restarts.
+
+| Entity | Table | Purpose |
+|---|---|---|
+| `RadiusClient` | `radius_clients` | NAS / NPS clients: name, IPv4/IPv6 address **or CIDR subnet**, dedicated shared secret, `active` flag. The most specific active match for the sender address supplies the secret used to validate the Message-Authenticator, decrypt `User-Password` and sign responses. Packets from unmatched addresses are dropped. |
+| `LdapDirectory` | `ldap_directories` | Federated directories: realm identifier(s), URL, base DN, search filter / DN pattern, bind credentials, timeouts, `priority`, `enabled`, `auto_provision`, `fallback_to_local`. `REALM\user` / `user@realm` is routed directly to the matching directory; unqualified names are evaluated across enabled directories in priority order (stopping at the first directory that knows the user; an unavailable directory fails closed). |
+| `SecurityPolicy` | `security_policies` | Policy `default`: RADIUS lockout threshold / duration / failure window, challenge TTL and max pending sessions, MFA approval TTL, MFA pre-auth lockout threshold / window, OTP reuse window. Read on every use, so changes apply cluster-wide immediately. |
+| `RadiusChallengeSession` | `radius_challenge_sessions` | Pending in-band `Access-Challenge` `State` sessions (single-use, atomically consumed). |
+| `MfaApproval` | `mfa_approvals` | Out-of-band MFA pre-authentication approvals (single-use, atomically consumed). |
+| `AuthFailureRecord` | `auth_failure_records` | Brute-force failure counters and lockouts (scopes `RADIUS` per user id, `MFA_PREAUTH` per user name). |
+| `AuthAuditLog` | `auth_audit_logs` | Append-only log of every authentication attempt (web login, MFA pre-auth, RADIUS): time, channel, user, client address / name, outcome and failure reason. |
+
+**Bootstrap.** When the application starts against an uninitialized database, each empty table is seeded from
+the legacy properties: the `default` security policy from `radius.max-failures`, `radius.lockout-seconds`,
+`radius.challenge.*` and `radius.mfa.ttl-seconds`; one RADIUS client per `radius.allowed-clients` entry (or the
+catch-all clients `0.0.0.0/0` and `::/0` when empty) with `radius.shared-secret`; and one LDAP directory named
+`default` from `ldap.*`. Tables that already contain data are never modified. Disable with
+`iam.bootstrap.seed-defaults=false`.
 
 ---
 

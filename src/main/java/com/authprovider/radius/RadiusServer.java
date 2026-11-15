@@ -1,6 +1,7 @@
 package com.authprovider.radius;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.stereotype.Component;
 
@@ -10,7 +11,6 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
-import java.net.UnknownHostException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
@@ -18,10 +18,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -52,15 +50,23 @@ public class RadiusServer implements SmartLifecycle {
     private Thread receiver;
     private ThreadPoolExecutor workers;
     private ScheduledExecutorService housekeeping;
-    private Set<InetAddress> allowedClients = Set.of();
+    private final RadiusClientRegistry clientRegistry;
 
     public RadiusServer(RadiusProperties properties, RadiusAuthenticationHandler handler,
                         RadiusChallengeStore challengeStore, RadiusAuthGuard authGuard, Clock clock) {
+        this(properties, handler, challengeStore, authGuard, clock, handler.getClientRegistry());
+    }
+
+    @Autowired
+    public RadiusServer(RadiusProperties properties, RadiusAuthenticationHandler handler,
+                        RadiusChallengeStore challengeStore, RadiusAuthGuard authGuard, Clock clock,
+                        RadiusClientRegistry clientRegistry) {
         this.properties = properties;
         this.handler = handler;
         this.challengeStore = challengeStore;
         this.authGuard = authGuard;
         this.clock = clock;
+        this.clientRegistry = clientRegistry != null ? clientRegistry : handler.getClientRegistry();
     }
 
     private static final class CachedResponse {
@@ -87,13 +93,7 @@ public class RadiusServer implements SmartLifecycle {
             return;
         }
         properties.validate();
-        allowedClients = resolveAllowedClients();
-        if (RadiusProperties.DEFAULT_SHARED_SECRET.equals(properties.getSharedSecret())) {
-            log.warn("RADIUS server is using the default shared secret; set radius.shared-secret to a strong value in production");
-        }
-        if (allowedClients.isEmpty()) {
-            log.warn("RADIUS server accepts requests from any client address; consider restricting radius.allowed-clients");
-        }
+        clientRegistry.validate();
 
         DatagramSocket datagramSocket;
         try {
@@ -197,10 +197,18 @@ public class RadiusServer implements SmartLifecycle {
 
     void process(byte[] data, InetSocketAddress source) {
         InetAddress address = source.getAddress();
-        if (!allowedClients.isEmpty() && !allowedClients.contains(address)) {
+        Optional<RadiusClientRegistry.ResolvedClient> client;
+        try {
+            client = clientRegistry.resolve(address);
+        } catch (RuntimeException e) {
+            log.error("Unable to resolve RADIUS client {}; request discarded", address.getHostAddress(), e);
+            return;
+        }
+        if (client.isEmpty()) {
             log.warn("Dropping RADIUS packet from unauthorized client {}", address.getHostAddress());
             return;
         }
+        RadiusClientRegistry.ResolvedClient resolvedClient = client.get();
         RadiusPacket packet;
         try {
             packet = RadiusPacket.decode(data, data.length);
@@ -209,7 +217,7 @@ public class RadiusServer implements SmartLifecycle {
             return;
         }
         if (packet.getCode() == STATUS_SERVER) {
-            handleSafely(packet, source).ifPresent(response -> send(response, source));
+            handleSafely(packet, source, resolvedClient).ifPresent(response -> send(response, source));
             return;
         }
         if (packet.getCode() != ACCESS_REQUEST) {
@@ -248,7 +256,7 @@ public class RadiusServer implements SmartLifecycle {
         }
 
         try {
-            Optional<byte[]> response = handleSafely(packet, source);
+            Optional<byte[]> response = handleSafely(packet, source, resolvedClient);
             if (response.isEmpty()) {
                 responseCache.remove(key, entry);
                 return;
@@ -279,9 +287,10 @@ public class RadiusServer implements SmartLifecycle {
         }
     }
 
-    private Optional<byte[]> handleSafely(RadiusPacket packet, InetSocketAddress source) {
+    private Optional<byte[]> handleSafely(RadiusPacket packet, InetSocketAddress source,
+                                          RadiusClientRegistry.ResolvedClient client) {
         try {
-            return handler.handle(packet, source.getAddress());
+            return handler.handle(packet, source.getAddress(), client);
         } catch (Exception e) {
             log.error("Error processing RADIUS request from {}; request discarded", source.getAddress().getHostAddress(), e);
             return Optional.empty();
@@ -313,24 +322,6 @@ public class RadiusServer implements SmartLifecycle {
     private void purgeResponseCache() {
         Instant now = clock.instant();
         responseCache.values().removeIf(cached -> !now.isBefore(cached.expiresAt));
-    }
-
-    private Set<InetAddress> resolveAllowedClients() {
-        Set<InetAddress> resolved = new HashSet<>();
-        if (properties.getAllowedClients() == null) {
-            return resolved;
-        }
-        for (String client : properties.getAllowedClients()) {
-            if (client == null || client.isBlank()) {
-                continue;
-            }
-            try {
-                resolved.addAll(Arrays.asList(InetAddress.getAllByName(client.trim())));
-            } catch (UnknownHostException e) {
-                throw new IllegalStateException("Unable to resolve radius.allowed-clients entry: " + client, e);
-            }
-        }
-        return Set.copyOf(resolved);
     }
 
     private static Thread daemon(Runnable runnable, String name) {

@@ -1,10 +1,7 @@
 package com.authprovider.ldap;
 
 import com.authprovider.config.LdapProperties;
-import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
 
 import javax.naming.AuthenticationException;
 import javax.naming.Context;
@@ -28,8 +25,11 @@ import java.util.Hashtable;
 import java.util.List;
 import java.util.Locale;
 
+/**
+ * Authenticates against a single LDAP directory. Instances are created per persisted directory by
+ * {@link FederatedDirectoryAuthenticator}.
+ */
 @Slf4j
-@Component
 public class JndiLdapDirectoryAuthenticator implements DirectoryAuthenticator {
 
     static final String LDAP_CONTEXT_FACTORY = "com.sun.jndi.ldap.LdapCtxFactory";
@@ -41,7 +41,6 @@ public class JndiLdapDirectoryAuthenticator implements DirectoryAuthenticator {
     private final LdapProperties properties;
     private final LdapContextFactory contextFactory;
 
-    @Autowired
     public JndiLdapDirectoryAuthenticator(LdapProperties properties) {
         this(properties, InitialDirContext::new);
     }
@@ -51,7 +50,6 @@ public class JndiLdapDirectoryAuthenticator implements DirectoryAuthenticator {
         this.contextFactory = contextFactory;
     }
 
-    @PostConstruct
     public void validateConfiguration() {
         if (!properties.isEnabled()) {
             return;

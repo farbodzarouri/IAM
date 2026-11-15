@@ -1,12 +1,20 @@
 package com.authprovider.ldap;
 
-public record DirectoryAuthenticationResult(Status status, String username, String distinguishedName) {
+/**
+ * Outcome of a directory bind. {@code directory} names the federated directory that produced the
+ * result (may be {@code null} for single-directory authenticators).
+ */
+public record DirectoryAuthenticationResult(Status status, String username, String distinguishedName, String directory) {
 
     public enum Status {
         AUTHENTICATED,
         INVALID_CREDENTIALS,
         USER_NOT_FOUND,
         UNAVAILABLE
+    }
+
+    public DirectoryAuthenticationResult(Status status, String username, String distinguishedName) {
+        this(status, username, distinguishedName, null);
     }
 
     public static DirectoryAuthenticationResult authenticated(String username, String distinguishedName) {
@@ -23,6 +31,10 @@ public record DirectoryAuthenticationResult(Status status, String username, Stri
 
     public static DirectoryAuthenticationResult unavailable() {
         return new DirectoryAuthenticationResult(Status.UNAVAILABLE, null, null);
+    }
+
+    public DirectoryAuthenticationResult withDirectory(String directoryName) {
+        return new DirectoryAuthenticationResult(status, username, distinguishedName, directoryName);
     }
 
     public boolean isAuthenticated() {

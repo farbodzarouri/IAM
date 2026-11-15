@@ -3,10 +3,12 @@ package com.authprovider.service;
 import com.authprovider.config.LdapProperties;
 import com.authprovider.dto.LoginRequest;
 import com.authprovider.dto.LoginResponse;
+import com.authprovider.entity.AuthAuditLog;
 import com.authprovider.entity.User;
 import com.authprovider.ldap.DirectoryAuthenticationResult;
 import com.authprovider.ldap.DirectoryAuthenticator;
-import lombok.RequiredArgsConstructor;
+import com.authprovider.ldap.DirectoryConfiguration;
+import com.authprovider.ldap.LdapPropertiesDirectoryConfiguration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -23,7 +25,6 @@ import java.util.regex.Pattern;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor(onConstructor_ = @Autowired)
 public class LoginServiceImpl implements LoginService {
 
     static final String ISSUER = "IAM";
@@ -34,19 +35,78 @@ public class LoginServiceImpl implements LoginService {
     private static final int MAX_PASSWORD_LENGTH = 1024;
     private static final Pattern OTP_PATTERN = Pattern.compile("^\\d{1,6}$");
 
-    private final LdapProperties ldapProperties;
+    private final DirectoryConfiguration directoryConfiguration;
     private final DirectoryAuthenticator directoryAuthenticator;
     private final UserService userService;
     private final SecretGenerator secretGenerator;
     private final TotpService totpService;
     private final QrCodeGenerator qrCodeGenerator;
+    private final AuthAuditService auditService;
     private final BCryptPasswordEncoder bcryptEncoder = new BCryptPasswordEncoder();
     private final Object provisioningLock = new Object();
     private final Map<Long, Long> lastUsedTimeStep = new ConcurrentHashMap<>();
     private volatile long lastStepPurgeTime = 0L;
 
+    public LoginServiceImpl(LdapProperties ldapProperties,
+                            DirectoryAuthenticator directoryAuthenticator,
+                            UserService userService,
+                            SecretGenerator secretGenerator,
+                            TotpService totpService,
+                            QrCodeGenerator qrCodeGenerator) {
+        this(new LdapPropertiesDirectoryConfiguration(ldapProperties), directoryAuthenticator, userService,
+                secretGenerator, totpService, qrCodeGenerator, AuthAuditService.noOp());
+    }
+
+    @Autowired
+    public LoginServiceImpl(DirectoryConfiguration directoryConfiguration,
+                            DirectoryAuthenticator directoryAuthenticator,
+                            UserService userService,
+                            SecretGenerator secretGenerator,
+                            TotpService totpService,
+                            QrCodeGenerator qrCodeGenerator,
+                            AuthAuditService auditService) {
+        this.directoryConfiguration = directoryConfiguration;
+        this.directoryAuthenticator = directoryAuthenticator;
+        this.userService = userService;
+        this.secretGenerator = secretGenerator;
+        this.totpService = totpService;
+        this.qrCodeGenerator = qrCodeGenerator;
+        this.auditService = auditService == null ? AuthAuditService.noOp() : auditService;
+    }
+
     @Override
     public LoginResponse login(LoginRequest request) {
+        LoginResponse response = doLogin(request);
+        audit(request, response);
+        return response;
+    }
+
+    private void audit(LoginRequest request, LoginResponse response) {
+        if (response == null) {
+            return;
+        }
+        LoginResponse.Status status = response.getStatus();
+        AuthAuditLog.Outcome outcome;
+        if (status == LoginResponse.Status.AUTHENTICATED) {
+            outcome = AuthAuditLog.Outcome.SUCCESS;
+        } else if (status == LoginResponse.Status.ENROLLMENT_REQUIRED) {
+            outcome = AuthAuditLog.Outcome.ENROLLMENT_REQUIRED;
+        } else if (status == LoginResponse.Status.DIRECTORY_UNAVAILABLE || status == LoginResponse.Status.ENROLLMENT_FAILED) {
+            outcome = AuthAuditLog.Outcome.ERROR;
+        } else {
+            outcome = AuthAuditLog.Outcome.FAILURE;
+        }
+        String username = response.getUsername() != null ? response.getUsername()
+                : request == null ? null : request.getUsername();
+        auditService.event(AuthAuditLog.Channel.WEB_LOGIN, outcome)
+                .username(username)
+                .userId(response.getUserId())
+                .reason(status == null ? null : status.name())
+                .source(response.getAuthenticationSource())
+                .log();
+    }
+
+    private LoginResponse doLogin(LoginRequest request) {
         if (request == null) {
             return failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required");
         }
@@ -56,7 +116,7 @@ public class LoginServiceImpl implements LoginService {
             return failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required");
         }
 
-        if (!ldapProperties.isEnabled()) {
+        if (directoryAuthenticator == null || !directoryConfiguration.isEnabled()) {
             return authenticateLocal(username, password, request.getOtp());
         }
         return authenticateWithDirectory(username, password, request.getOtp());
@@ -77,9 +137,9 @@ public class LoginServiceImpl implements LoginService {
         switch (result.status()) {
             case AUTHENTICATED:
                 String canonical = result.username() != null ? result.username() : username;
-                return completeDirectoryLogin(canonical, otp);
+                return completeDirectoryLogin(canonical, otp, directoryConfiguration.isAutoProvision(result));
             case USER_NOT_FOUND:
-                if (ldapProperties.isFallbackToLocal()) {
+                if (directoryConfiguration.isFallbackToLocal(username)) {
                     return authenticateLocal(username, password, otp);
                 }
                 return invalidCredentials();
@@ -91,7 +151,7 @@ public class LoginServiceImpl implements LoginService {
         }
     }
 
-    private LoginResponse completeDirectoryLogin(String username, String otp) {
+    private LoginResponse completeDirectoryLogin(String username, String otp, boolean autoProvision) {
         User user;
         synchronized (provisioningLock) {
             List<User> matches = userService.findAllByUsernameIgnoreCase(username);
@@ -100,7 +160,7 @@ public class LoginServiceImpl implements LoginService {
                 return failure(LoginResponse.Status.ACCOUNT_CONFLICT, "Account cannot be resolved uniquely");
             }
             if (matches == null || matches.isEmpty()) {
-                if (!ldapProperties.isAutoProvision()) {
+                if (!autoProvision) {
                     return failure(LoginResponse.Status.NOT_PROVISIONED, "Account is not provisioned");
                 }
                 log.info("Provisioning local account for directory user {}", username);

@@ -1,7 +1,10 @@
 package com.authprovider.radius;
 
+import com.authprovider.entity.AuthAuditLog;
 import com.authprovider.entity.User;
+import com.authprovider.service.AuthAuditService;
 import com.authprovider.service.MfaPreAuthService;
+import com.authprovider.service.SecurityPolicyService;
 import com.authprovider.service.UserOtpService;
 import com.authprovider.service.UsernameNormalizer;
 import lombok.extern.slf4j.Slf4j;
@@ -13,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Pattern;
 
@@ -33,6 +37,16 @@ public class RadiusAuthenticationHandler {
     private final RadiusChallengeStore challengeStore;
     private final RadiusAuthGuard authGuard;
     private final MfaPreAuthService mfaPreAuthService;
+    private final RadiusClientRegistry clientRegistry;
+    private final SecurityPolicyService policyService;
+    private final AuthAuditService auditService;
+
+    /** Per-request context: the sending client and its shared secret. */
+    private record RequestContext(InetAddress address, String clientName, byte[] secret) {
+        String host() {
+            return address.getHostAddress();
+        }
+    }
 
     public RadiusAuthenticationHandler(RadiusProperties properties,
                                        PrimaryCredentialVerifier credentialVerifier,
@@ -42,43 +56,79 @@ public class RadiusAuthenticationHandler {
         this(properties, credentialVerifier, userOtpService, challengeStore, authGuard, null);
     }
 
-    @Autowired
     public RadiusAuthenticationHandler(RadiusProperties properties,
                                        PrimaryCredentialVerifier credentialVerifier,
                                        UserOtpService userOtpService,
                                        RadiusChallengeStore challengeStore,
                                        RadiusAuthGuard authGuard,
                                        MfaPreAuthService mfaPreAuthService) {
+        this(properties, credentialVerifier, userOtpService, challengeStore, authGuard, mfaPreAuthService,
+                new RadiusClientRegistry(properties), SecurityPolicyService.fromProperties(properties),
+                AuthAuditService.noOp());
+    }
+
+    @Autowired
+    public RadiusAuthenticationHandler(RadiusProperties properties,
+                                       PrimaryCredentialVerifier credentialVerifier,
+                                       UserOtpService userOtpService,
+                                       RadiusChallengeStore challengeStore,
+                                       RadiusAuthGuard authGuard,
+                                       MfaPreAuthService mfaPreAuthService,
+                                       RadiusClientRegistry clientRegistry,
+                                       SecurityPolicyService policyService,
+                                       AuthAuditService auditService) {
         this.properties = properties;
         this.credentialVerifier = credentialVerifier;
         this.userOtpService = userOtpService;
         this.challengeStore = challengeStore;
         this.authGuard = authGuard;
         this.mfaPreAuthService = mfaPreAuthService;
+        this.clientRegistry = clientRegistry;
+        this.policyService = policyService;
+        this.auditService = auditService == null ? AuthAuditService.noOp() : auditService;
     }
 
+    RadiusClientRegistry getClientRegistry() {
+        return clientRegistry;
+    }
+
+    /**
+     * Handles a request, resolving the client's shared secret from its address. Requests from
+     * unknown clients are silently discarded.
+     */
     public Optional<byte[]> handle(RadiusPacket request, InetAddress clientAddress) {
+        Optional<RadiusClientRegistry.ResolvedClient> client = clientRegistry.resolve(clientAddress);
+        if (client.isEmpty()) {
+            log.warn("Dropping RADIUS packet from unauthorized client {}", clientAddress.getHostAddress());
+            return Optional.empty();
+        }
+        return handle(request, clientAddress, client.get());
+    }
+
+    /** Handles a request from an already resolved client. */
+    public Optional<byte[]> handle(RadiusPacket request, InetAddress clientAddress, RadiusClientRegistry.ResolvedClient client) {
+        RequestContext context = new RequestContext(clientAddress, client.name(), client.secret());
         return switch (request.getCode()) {
-            case ACCESS_REQUEST -> handleAccessRequest(request, clientAddress);
-            case STATUS_SERVER -> handleStatusServer(request, clientAddress);
+            case ACCESS_REQUEST -> handleAccessRequest(request, context);
+            case STATUS_SERVER -> handleStatusServer(request, context);
             default -> {
-                log.debug("Discarding unsupported RADIUS code {} from {}", request.getCode(), clientAddress.getHostAddress());
+                log.debug("Discarding unsupported RADIUS code {} from {}", request.getCode(), context.host());
                 yield Optional.empty();
             }
         };
     }
 
-    private Optional<byte[]> handleStatusServer(RadiusPacket request, InetAddress clientAddress) {
-        if (!RadiusCrypto.verifyRequestMessageAuthenticator(request, properties.sharedSecretBytes())) {
-            log.warn("Discarding Status-Server from {} with missing or invalid Message-Authenticator", clientAddress.getHostAddress());
+    private Optional<byte[]> handleStatusServer(RadiusPacket request, RequestContext context) {
+        if (!RadiusCrypto.verifyRequestMessageAuthenticator(request, context.secret())) {
+            log.warn("Discarding Status-Server from {} with missing or invalid Message-Authenticator", context.host());
             return Optional.empty();
         }
-        return Optional.of(respond(request, ACCESS_ACCEPT, List.of()));
+        return Optional.of(respond(request, context, ACCESS_ACCEPT, List.of()));
     }
 
-    private Optional<byte[]> handleAccessRequest(RadiusPacket request, InetAddress clientAddress) {
-        byte[] secret = properties.sharedSecretBytes();
-        String client = clientAddress.getHostAddress();
+    private Optional<byte[]> handleAccessRequest(RadiusPacket request, RequestContext context) {
+        byte[] secret = context.secret();
+        String client = context.host();
         boolean hasEap = request.countAttributes(ATTR_EAP_MESSAGE) > 0;
 
         if (request.hasMessageAuthenticator()) {
@@ -91,9 +141,12 @@ public class RadiusAuthenticationHandler {
             return Optional.empty();
         }
 
+        String rawUserName = request.findAttribute(ATTR_USER_NAME).map(RadiusAttribute::getValueAsString).orElse(null);
+
         if (hasEap) {
             log.info("Rejecting EAP Access-Request from {}: EAP is not supported", client);
-            return Optional.of(reject(request));
+            audit(context, rawUserName, null, AuthAuditLog.Outcome.FAILURE, "EAP_NOT_SUPPORTED", null);
+            return Optional.of(reject(request, context));
         }
 
         if (request.countAttributes(ATTR_CHAP_PASSWORD) != 0
@@ -101,12 +154,14 @@ public class RadiusAuthenticationHandler {
                 || request.countAttributes(ATTR_USER_PASSWORD) > 1
                 || request.countAttributes(ATTR_STATE) > 1) {
             log.info("Rejecting malformed or unsupported Access-Request from {}", client);
-            return Optional.of(reject(request));
+            audit(context, rawUserName, null, AuthAuditLog.Outcome.FAILURE, "MALFORMED_REQUEST", null);
+            return Optional.of(reject(request, context));
         }
 
         String userName = request.findAttribute(ATTR_USER_NAME).orElseThrow().getValueAsString();
         if (userName.isBlank()) {
-            return Optional.of(reject(request));
+            audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "MALFORMED_REQUEST", null);
+            return Optional.of(reject(request, context));
         }
 
         Optional<RadiusAttribute> passwordAttr = request.findAttribute(ATTR_USER_PASSWORD);
@@ -115,9 +170,10 @@ public class RadiusAuthenticationHandler {
         if (passwordAttr.isEmpty()) {
             if (stateAttr.isPresent()) {
                 log.info("Rejecting Access-Request from {}: State without User-Password", client);
-                return Optional.of(reject(request));
+                audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "MALFORMED_REQUEST", null);
+                return Optional.of(reject(request, context));
             }
-            return Optional.of(handleOutOfBandApproval(request, clientAddress, userName));
+            return Optional.of(handleOutOfBandApproval(request, context, userName));
         }
 
         byte[] password;
@@ -126,122 +182,142 @@ public class RadiusAuthenticationHandler {
                     passwordAttr.get().getValue(), secret, request.getAuthenticator());
         } catch (RadiusException e) {
             log.info("Rejecting Access-Request from {}: {}", client, e.getMessage());
-            return Optional.of(reject(request));
+            audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "MALFORMED_PASSWORD", null);
+            return Optional.of(reject(request, context));
         }
 
         try {
             if (stateAttr.isPresent()) {
-                return Optional.of(handleChallengeResponse(request, clientAddress, userName, stateAttr.get().getValue(), password));
+                return Optional.of(handleChallengeResponse(request, context, userName, stateAttr.get().getValue(), password));
             }
-            return Optional.of(handlePrimaryAuthentication(request, clientAddress, userName, password));
+            return Optional.of(handlePrimaryAuthentication(request, context, userName, password));
         } finally {
             Arrays.fill(password, (byte) 0);
         }
     }
 
-    private byte[] handleOutOfBandApproval(RadiusPacket request, InetAddress clientAddress, String userName) {
-        String client = clientAddress.getHostAddress();
+    private byte[] handleOutOfBandApproval(RadiusPacket request, RequestContext context, String userName) {
+        String client = context.host();
         String safeUser = sanitize(userName);
         if (mfaPreAuthService == null || properties.getMfa() == null || !properties.getMfa().isOutOfBandEnabled()) {
             log.info("RADIUS Access-Reject for user '{}' from {} (User-Password required; out-of-band MFA disabled)",
                     safeUser, client);
-            return reject(request);
+            audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "OUT_OF_BAND_DISABLED", null);
+            return reject(request, context);
         }
         if (mfaPreAuthService.consumeApproval(userName)) {
             log.info("RADIUS Access-Accept for user '{}' from {} (MFA approval consumed)", safeUser, client);
-            return respond(request, ACCESS_ACCEPT, List.of());
+            audit(context, userName, null, AuthAuditLog.Outcome.SUCCESS, "MFA_APPROVAL_CONSUMED", null);
+            return respond(request, context, ACCESS_ACCEPT, List.of());
         }
         log.info("RADIUS Access-Reject for user '{}' from {} (no active MFA approval)", safeUser, client);
-        return respond(request, ACCESS_REJECT,
+        audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "NO_MFA_APPROVAL", null);
+        return respond(request, context, ACCESS_REJECT,
                 List.of(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, OUT_OF_BAND_REJECT_MESSAGE)));
     }
 
-    private byte[] handlePrimaryAuthentication(RadiusPacket request, InetAddress clientAddress, String userName, byte[] password) {
-        String client = clientAddress.getHostAddress();
+    private byte[] handlePrimaryAuthentication(RadiusPacket request, RequestContext context, String userName, byte[] password) {
+        String client = context.host();
         String safeUser = sanitize(userName);
         PrimaryCredentialVerifier.Verification verification =
                 credentialVerifier.verify(userName, password, authGuard::isLocked);
         User user = verification.user();
+        Long userId = user == null ? null : user.getId();
         switch (verification.outcome()) {
             case AUTHENTICATED:
                 break;
             case UNKNOWN_USER:
                 log.info("RADIUS primary authentication failed for unknown user '{}' from {} ({})",
                         safeUser, client, verification.source());
-                return reject(request);
+                audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "UNKNOWN_USER", verification.source());
+                return reject(request, context);
             case LOCKED:
                 log.warn("RADIUS authentication refused for locked-out user '{}' from {}", safeUser, client);
-                    return reject(request);
+                audit(context, userName, userId, AuthAuditLog.Outcome.LOCKED, "LOCKED_OUT", verification.source());
+                return reject(request, context);
             case NOT_ENROLLED:
                 log.warn("RADIUS authentication refused for user '{}' ({}): no OTP secret enrolled",
                         safeUser, verification.source());
-                return respond(request, ACCESS_REJECT,
+                audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "NOT_ENROLLED", verification.source());
+                return respond(request, context, ACCESS_REJECT,
                         List.of(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, NOT_ENROLLED_REJECT_MESSAGE)));
             case DIRECTORY_UNAVAILABLE:
                 log.error("RADIUS authentication for user '{}' from {} failed: directory service unavailable",
                         safeUser, client);
-                return reject(request);
+                audit(context, userName, null, AuthAuditLog.Outcome.ERROR, "DIRECTORY_UNAVAILABLE", verification.source());
+                return reject(request, context);
             case INVALID_CREDENTIALS:
             default:
-                if (user != null && user.getId() != null) {
-                    authGuard.recordFailure(user.getId());
+                if (userId != null) {
+                    authGuard.recordFailure(userId);
                 }
                 log.info("RADIUS primary authentication failed for user '{}' from {} ({})",
                         safeUser, client, verification.source());
-                return reject(request);
+                audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "INVALID_CREDENTIALS", verification.source());
+                return reject(request, context);
         }
         log.debug("RADIUS primary credentials for user '{}' verified against {}", safeUser, verification.source());
-        Optional<byte[]> state = challengeStore.create(user.getId(), userName, clientAddress);
+        Optional<byte[]> state = challengeStore.create(userId, userName, context.address());
         if (state.isEmpty()) {
             log.error("RADIUS challenge capacity exhausted; rejecting user '{}' from {}", safeUser, client);
-            return reject(request);
+            audit(context, userName, userId, AuthAuditLog.Outcome.ERROR, "CHALLENGE_CAPACITY_EXHAUSTED", verification.source());
+            return reject(request, context);
         }
         log.info("RADIUS primary authentication succeeded for user '{}' from {}; issuing OTP challenge", safeUser, client);
+        audit(context, userName, userId, AuthAuditLog.Outcome.CHALLENGE, "OTP_CHALLENGE_ISSUED", verification.source());
         List<RadiusAttribute> attributes = new ArrayList<>();
         attributes.add(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, properties.getChallenge().getPrompt()));
         attributes.add(new RadiusAttribute(ATTR_STATE, state.get()));
-        attributes.add(RadiusAttribute.ofInteger(ATTR_SESSION_TIMEOUT, properties.getChallenge().getTtlSeconds()));
-        return respond(request, ACCESS_CHALLENGE, attributes);
+        attributes.add(RadiusAttribute.ofInteger(ATTR_SESSION_TIMEOUT, policyService.current().getChallengeTtlSeconds()));
+        return respond(request, context, ACCESS_CHALLENGE, attributes);
     }
 
-    private byte[] handleChallengeResponse(RadiusPacket request, InetAddress clientAddress, String userName,
+    private byte[] handleChallengeResponse(RadiusPacket request, RequestContext context, String userName,
                                            byte[] state, byte[] password) {
-        String client = clientAddress.getHostAddress();
+        String client = context.host();
         String safeUser = sanitize(userName);
         Optional<RadiusChallengeStore.ChallengeSession> consumed = challengeStore.consume(state);
         if (consumed.isEmpty()) {
             log.info("RADIUS challenge response from {} for user '{}' has unknown, expired or reused State", client, safeUser);
-            return reject(request);
+            audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "INVALID_STATE", null);
+            return reject(request, context);
         }
         RadiusChallengeStore.ChallengeSession session = consumed.get();
-        if (!session.clientAddress().equals(clientAddress) || !sameUser(session.userName(), userName)) {
+        Long userId = session.userId();
+        if (!Objects.equals(session.clientAddress(), context.address()) || !sameUser(session.userName(), userName)) {
             log.warn("RADIUS challenge response from {} for user '{}' does not match the issued challenge", client, safeUser);
-            return reject(request);
+            audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "CHALLENGE_MISMATCH", null);
+            return reject(request, context);
         }
-        if (authGuard.isLocked(session.userId())) {
+        if (authGuard.isLocked(userId)) {
             log.warn("RADIUS authentication refused for locked-out user '{}' from {}", safeUser, client);
-            return reject(request);
+            audit(context, userName, userId, AuthAuditLog.Outcome.LOCKED, "LOCKED_OUT", null);
+            return reject(request, context);
         }
         String otp = new String(password, StandardCharsets.UTF_8).trim();
         if (!OTP_PATTERN.matcher(otp).matches()) {
-            authGuard.recordFailure(session.userId());
+            authGuard.recordFailure(userId);
             log.info("RADIUS OTP verification failed for user '{}' from {}: malformed passcode", safeUser, client);
-            return reject(request);
+            audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "MALFORMED_OTP", null);
+            return reject(request, context);
         }
-        boolean valid = userOtpService.validateUserOtp(session.userId(), Integer.parseInt(otp)).orElse(false);
+        boolean valid = userOtpService.validateUserOtp(userId, Integer.parseInt(otp)).orElse(false);
         if (!valid) {
-            authGuard.recordFailure(session.userId());
+            authGuard.recordFailure(userId);
             log.info("RADIUS OTP verification failed for user '{}' from {}", safeUser, client);
-            return reject(request);
+            audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "INVALID_OTP", null);
+            return reject(request, context);
         }
-        if (!authGuard.markOtpUsed(session.userId(), otp)) {
-            authGuard.recordFailure(session.userId());
+        if (!authGuard.markOtpUsed(userId, otp)) {
+            authGuard.recordFailure(userId);
             log.warn("RADIUS OTP replay detected for user '{}' from {}", safeUser, client);
-            return reject(request);
+            audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "OTP_REPLAY", null);
+            return reject(request, context);
         }
-        authGuard.recordSuccess(session.userId());
+        authGuard.recordSuccess(userId);
         log.info("RADIUS authentication succeeded for user '{}' from {}", safeUser, client);
-        return respond(request, ACCESS_ACCEPT, List.of());
+        audit(context, userName, userId, AuthAuditLog.Outcome.SUCCESS, "AUTHENTICATED", null);
+        return respond(request, context, ACCESS_ACCEPT, List.of());
     }
 
     private boolean sameUser(String sessionUser, String requestUser) {
@@ -256,15 +332,22 @@ public class RadiusAuthenticationHandler {
         return false;
     }
 
-    private byte[] reject(RadiusPacket request) {
-        return respond(request, ACCESS_REJECT, List.of(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, REJECT_MESSAGE)));
+    private void audit(RequestContext context, String userName, Long userId, AuthAuditLog.Outcome outcome,
+                       String reason, String source) {
+        auditService.record(AuthAuditLog.Channel.RADIUS, userName, userId, context.host(), context.clientName(),
+                outcome, reason, source);
     }
 
-    private byte[] respond(RadiusPacket request, int code, List<RadiusAttribute> attributes) {
+    private byte[] reject(RadiusPacket request, RequestContext context) {
+        return respond(request, context, ACCESS_REJECT,
+                List.of(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, REJECT_MESSAGE)));
+    }
+
+    private byte[] respond(RadiusPacket request, RequestContext context, int code, List<RadiusAttribute> attributes) {
         List<RadiusAttribute> all = new ArrayList<>(attributes);
         all.addAll(request.getAttributes(ATTR_PROXY_STATE));
         return RadiusCrypto.buildResponse(code, request.getIdentifier(), request.getAuthenticator(), all,
-                properties.sharedSecretBytes());
+                context.secret());
     }
 
     static String sanitize(String value) {

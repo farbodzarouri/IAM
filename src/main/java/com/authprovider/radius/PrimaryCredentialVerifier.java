@@ -4,6 +4,8 @@ import com.authprovider.config.LdapProperties;
 import com.authprovider.entity.User;
 import com.authprovider.ldap.DirectoryAuthenticationResult;
 import com.authprovider.ldap.DirectoryAuthenticator;
+import com.authprovider.ldap.DirectoryConfiguration;
+import com.authprovider.ldap.LdapPropertiesDirectoryConfiguration;
 import com.authprovider.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,7 +34,7 @@ public class PrimaryCredentialVerifier {
 
     private final UserRepository userRepository;
     private final RadiusProperties properties;
-    private final LdapProperties ldapProperties;
+    private final DirectoryConfiguration directoryConfiguration;
     private final DirectoryAuthenticator directoryAuthenticator;
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
@@ -56,27 +58,35 @@ public class PrimaryCredentialVerifier {
     }
 
     public PrimaryCredentialVerifier(UserRepository userRepository, RadiusProperties properties) {
-        this(userRepository, properties, null, null);
+        this(userRepository, properties, (DirectoryConfiguration) null, null);
+    }
+
+    public PrimaryCredentialVerifier(UserRepository userRepository, RadiusProperties properties,
+                                     LdapProperties ldapProperties, DirectoryAuthenticator directoryAuthenticator) {
+        this(userRepository, properties,
+                ldapProperties == null ? null : new LdapPropertiesDirectoryConfiguration(ldapProperties),
+                directoryAuthenticator);
     }
 
     @Autowired
     public PrimaryCredentialVerifier(UserRepository userRepository, RadiusProperties properties,
-                                     LdapProperties ldapProperties, DirectoryAuthenticator directoryAuthenticator) {
+                                     DirectoryConfiguration directoryConfiguration,
+                                     DirectoryAuthenticator directoryAuthenticator) {
         this.userRepository = userRepository;
         this.properties = properties;
-        this.ldapProperties = ldapProperties;
+        this.directoryConfiguration = directoryConfiguration;
         this.directoryAuthenticator = directoryAuthenticator;
     }
 
     public boolean isDirectoryEnabled() {
-        return ldapProperties != null && ldapProperties.isEnabled() && directoryAuthenticator != null;
+        return directoryConfiguration != null && directoryAuthenticator != null && directoryConfiguration.isEnabled();
     }
 
     /**
      * Verifies the primary credentials of a RADIUS user. When LDAP is enabled the password is verified
      * against the directory and the directory identity is linked to an already enrolled local account
      * (no just-in-time provisioning over RADIUS); local passwords are only consulted for accounts unknown
-     * to the directory and only if {@code ldap.fallback-to-local=true}. Otherwise the local user store is used.
+     * to the directory and only if the responsible directories permit fallback to local accounts. Otherwise the local user store is used.
      */
     public Verification verify(String userName, byte[] password, Predicate<Long> isLocked) {
         Optional<User> localUser = findUser(userName);
@@ -113,7 +123,10 @@ public class PrimaryCredentialVerifier {
         String loginName = directoryLoginName(userName);
         DirectoryAuthenticationResult result;
         try {
-            result = directoryAuthenticator.authenticate(loginName, new String(password, StandardCharsets.UTF_8));
+            String rawPassword = new String(password, StandardCharsets.UTF_8);
+            result = directoryAuthenticator.isRealmAware()
+                    ? directoryAuthenticator.authenticateQualified(userName.trim(), loginName, rawPassword)
+                    : directoryAuthenticator.authenticate(loginName, rawPassword);
         } catch (RuntimeException e) {
             log.error("Directory authentication for RADIUS user '{}' failed unexpectedly",
                     RadiusAuthenticationHandler.sanitize(loginName), e);
@@ -142,7 +155,7 @@ public class PrimaryCredentialVerifier {
                 return new Verification(Outcome.AUTHENTICATED, user, SOURCE_DIRECTORY);
             }
             case USER_NOT_FOUND:
-                if (ldapProperties.isFallbackToLocal()) {
+                if (directoryConfiguration.isFallbackToLocal(userName)) {
                     return verifyLocal(localUser, password, SOURCE_LOCAL);
                 }
                 return new Verification(Outcome.UNKNOWN_USER, null, SOURCE_DIRECTORY);
