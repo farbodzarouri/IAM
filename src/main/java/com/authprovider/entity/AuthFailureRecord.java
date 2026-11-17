@@ -26,6 +26,11 @@ public class AuthFailureRecord {
 
     public static final String SCOPE_RADIUS = "RADIUS";
     public static final String SCOPE_MFA_PREAUTH = "MFA_PREAUTH";
+    /**
+     * Account-wide failure tracking (keyed by user id) shared by every authentication channel. It reuses
+     * the historical RADIUS scope name so existing records keep their meaning.
+     */
+    public static final String SCOPE_ACCOUNT = SCOPE_RADIUS;
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

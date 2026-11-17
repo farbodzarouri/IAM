@@ -17,10 +17,7 @@ import org.springframework.stereotype.Service;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.List;
-import java.util.Map;
-import java.util.OptionalLong;
-import java.util.concurrent.ConcurrentHashMap;
+import java.time.Clock;
 import java.util.regex.Pattern;
 
 @Slf4j
@@ -34,6 +31,7 @@ public class LoginServiceImpl implements LoginService {
     private static final int MAX_USERNAME_LENGTH = 256;
     private static final int MAX_PASSWORD_LENGTH = 1024;
     private static final Pattern OTP_PATTERN = Pattern.compile("^\\d{1,6}$");
+    private static final String DUMMY_HASH = new BCryptPasswordEncoder().encode("\u0000dummy-password\u0000");
 
     private final DirectoryConfiguration directoryConfiguration;
     private final DirectoryAuthenticator directoryAuthenticator;
@@ -42,10 +40,18 @@ public class LoginServiceImpl implements LoginService {
     private final TotpService totpService;
     private final QrCodeGenerator qrCodeGenerator;
     private final AuthAuditService auditService;
+    private final OtpVerificationService otpVerifier;
+    private final AccountLockoutService lockoutService;
+    /** Resolves the account that authenticates (local login / directory linking / provisioning). */
+    private final AccountResolver accountResolver;
+    /** Resolves the account a request applies to for lockout purposes, before any credential is checked. */
+    private final AccountResolver lockoutSubjectResolver;
     private final BCryptPasswordEncoder bcryptEncoder = new BCryptPasswordEncoder();
     private final Object provisioningLock = new Object();
-    private final Map<Long, Long> lastUsedTimeStep = new ConcurrentHashMap<>();
-    private volatile long lastStepPurgeTime = 0L;
+
+    /** Internal result carrying the audit details next to the API response. */
+    private record Outcome(LoginResponse response, boolean locked) {
+    }
 
     public LoginServiceImpl(LdapProperties ldapProperties,
                             DirectoryAuthenticator directoryAuthenticator,
@@ -57,7 +63,6 @@ public class LoginServiceImpl implements LoginService {
                 secretGenerator, totpService, qrCodeGenerator, AuthAuditService.noOp());
     }
 
-    @Autowired
     public LoginServiceImpl(DirectoryConfiguration directoryConfiguration,
                             DirectoryAuthenticator directoryAuthenticator,
                             UserService userService,
@@ -65,6 +70,19 @@ public class LoginServiceImpl implements LoginService {
                             TotpService totpService,
                             QrCodeGenerator qrCodeGenerator,
                             AuthAuditService auditService) {
+        this(directoryConfiguration, directoryAuthenticator, userService, secretGenerator, totpService,
+                qrCodeGenerator, auditService, sharedVerifier(userService, totpService));
+    }
+
+    @Autowired
+    public LoginServiceImpl(DirectoryConfiguration directoryConfiguration,
+                            DirectoryAuthenticator directoryAuthenticator,
+                            UserService userService,
+                            SecretGenerator secretGenerator,
+                            TotpService totpService,
+                            QrCodeGenerator qrCodeGenerator,
+                            AuthAuditService auditService,
+                            OtpVerificationService otpVerifier) {
         this.directoryConfiguration = directoryConfiguration;
         this.directoryAuthenticator = directoryAuthenticator;
         this.userService = userService;
@@ -72,22 +90,38 @@ public class LoginServiceImpl implements LoginService {
         this.totpService = totpService;
         this.qrCodeGenerator = qrCodeGenerator;
         this.auditService = auditService == null ? AuthAuditService.noOp() : auditService;
+        this.otpVerifier = otpVerifier == null ? sharedVerifier(userService, totpService) : otpVerifier;
+        this.lockoutService = this.otpVerifier.lockoutService();
+        this.accountResolver = new AccountResolver(userService::findAllByUsernameIgnoreCase, null);
+        this.lockoutSubjectResolver = new AccountResolver(userService::findByUsernameIgnoreCase, null);
+    }
+
+    private static OtpVerificationService sharedVerifier(UserService userService, TotpService totpService) {
+        AccountSecuritySupport support = AccountSecuritySupport.of(userService);
+        if (support != null && support.accountLockoutService() != null) {
+            AccountLockoutService lockout = support.accountLockoutService();
+            return new OtpVerificationService(totpService, null, support.otpUsageStore(), lockout, lockout.clock());
+        }
+        return OtpVerificationService.inMemory(totpService, null, Clock.systemUTC());
     }
 
     @Override
     public LoginResponse login(LoginRequest request) {
-        LoginResponse response = doLogin(request);
-        audit(request, response);
-        return response;
+        Outcome outcome = doLogin(request);
+        audit(request, outcome);
+        return outcome.response();
     }
 
-    private void audit(LoginRequest request, LoginResponse response) {
+    private void audit(LoginRequest request, Outcome result) {
+        LoginResponse response = result == null ? null : result.response();
         if (response == null) {
             return;
         }
         LoginResponse.Status status = response.getStatus();
         AuthAuditLog.Outcome outcome;
-        if (status == LoginResponse.Status.AUTHENTICATED) {
+        if (result.locked()) {
+            outcome = AuthAuditLog.Outcome.LOCKED;
+        } else if (status == LoginResponse.Status.AUTHENTICATED) {
             outcome = AuthAuditLog.Outcome.SUCCESS;
         } else if (status == LoginResponse.Status.ENROLLMENT_REQUIRED) {
             outcome = AuthAuditLog.Outcome.ENROLLMENT_REQUIRED;
@@ -101,19 +135,19 @@ public class LoginServiceImpl implements LoginService {
         auditService.event(AuthAuditLog.Channel.WEB_LOGIN, outcome)
                 .username(username)
                 .userId(response.getUserId())
-                .reason(status == null ? null : status.name())
+                .reason(result.locked() ? "LOCKED_OUT" : status == null ? null : status.name())
                 .source(response.getAuthenticationSource())
                 .log();
     }
 
-    private LoginResponse doLogin(LoginRequest request) {
+    private Outcome doLogin(LoginRequest request) {
         if (request == null) {
-            return failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required");
+            return result(failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required"));
         }
         String username = normalizeUsername(request.getUsername());
         String password = request.getPassword();
         if (username == null || password == null || password.isEmpty() || password.length() > MAX_PASSWORD_LENGTH) {
-            return failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required");
+            return result(failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required"));
         }
 
         if (directoryAuthenticator == null || !directoryConfiguration.isEnabled()) {
@@ -122,7 +156,13 @@ public class LoginServiceImpl implements LoginService {
         return authenticateWithDirectory(username, password, request.getOtp());
     }
 
-    private LoginResponse authenticateWithDirectory(String username, String password, String otp) {
+    private Outcome authenticateWithDirectory(String username, String password, String otp) {
+        // Lockouts are enforced before the directory bind so that a locked account cannot be used to
+        // probe (or lock out) the directory account.
+        User lockSubject = lockoutSubjectResolver.resolve(username, true).user();
+        if (lockSubject != null && lockoutService.isLocked(lockSubject.getId())) {
+            return locked(lockSubject);
+        }
         DirectoryAuthenticationResult result;
         try {
             result = directoryAuthenticator.authenticate(username, password);
@@ -136,119 +176,157 @@ public class LoginServiceImpl implements LoginService {
 
         switch (result.status()) {
             case AUTHENTICATED:
-                String canonical = result.username() != null ? result.username() : username;
+                String canonical = result.username() != null && !result.username().isBlank()
+                        ? result.username() : username;
                 return completeDirectoryLogin(canonical, otp, directoryConfiguration.isAutoProvision(result));
             case USER_NOT_FOUND:
                 if (directoryConfiguration.isFallbackToLocal(username)) {
                     return authenticateLocal(username, password, otp);
                 }
-                return invalidCredentials();
+                return result(invalidCredentials());
             case UNAVAILABLE:
-                return failure(LoginResponse.Status.DIRECTORY_UNAVAILABLE, "Directory service is unavailable");
+                return result(failure(LoginResponse.Status.DIRECTORY_UNAVAILABLE, "Directory service is unavailable"));
             case INVALID_CREDENTIALS:
             default:
-                return invalidCredentials();
+                if (lockSubject != null) {
+                    lockoutService.recordFailure(lockSubject.getId());
+                }
+                return result(invalidCredentials());
         }
     }
 
-    private LoginResponse completeDirectoryLogin(String username, String otp, boolean autoProvision) {
+    private Outcome completeDirectoryLogin(String username, String otp, boolean autoProvision) {
         User user;
         synchronized (provisioningLock) {
-            List<User> matches = userService.findAllByUsernameIgnoreCase(username);
-            if (matches != null && matches.size() > 1) {
+            // The directory's canonical name is authoritative: it is linked as is (no realm stripping),
+            // exactly like RADIUS links directory identities (see PrimaryCredentialVerifier#findLinkedAccount).
+            AccountResolver.Resolution resolution = accountResolver.resolve(username, false);
+            if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
                 log.error("Multiple local accounts match directory user {}; refusing to link", username);
-                return failure(LoginResponse.Status.ACCOUNT_CONFLICT, "Account cannot be resolved uniquely");
+                return result(failure(LoginResponse.Status.ACCOUNT_CONFLICT, "Account cannot be resolved uniquely"));
             }
-            if (matches == null || matches.isEmpty()) {
+            if (!resolution.isFound()) {
                 if (!autoProvision) {
-                    return failure(LoginResponse.Status.NOT_PROVISIONED, "Account is not provisioned");
+                    return result(failure(LoginResponse.Status.NOT_PROVISIONED, "Account is not provisioned"));
                 }
                 log.info("Provisioning local account for directory user {}", username);
-                return enroll(User.builder().username(username).build(), SOURCE_DIRECTORY);
+                Outcome provisioned = enrollOutcome(User.builder().username(username).build(), SOURCE_DIRECTORY);
+                if (provisioned.response().getStatus() != LoginResponse.Status.ENROLLMENT_FAILED) {
+                    return provisioned;
+                }
+                // Another node may have provisioned the same account concurrently: link to it instead.
+                resolution = accountResolver.resolve(username, false);
+                if (!resolution.isFound()) {
+                    return provisioned;
+                }
             }
-            user = matches.get(0);
+            user = resolution.user();
+        }
+        if (lockoutService.isLocked(user.getId())) {
+            return locked(user);
         }
         return verifySecondFactor(user, SOURCE_DIRECTORY, otp);
     }
 
-    private LoginResponse authenticateLocal(String username, String password, String otp) {
-        List<User> candidates = userService.findAllByUsernameIgnoreCase(username);
-        List<User> matches = candidates == null ? List.of() : candidates.stream()
-                .filter(candidate -> username.equals(candidate.getUsername()))
-                .toList();
-        if (matches.size() != 1) {
-            if (matches.size() > 1) {
+    private Outcome authenticateLocal(String username, String password, String otp) {
+        AccountResolver.Resolution resolution = accountResolver.resolve(username, true);
+        if (!resolution.isFound()) {
+            if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
                 log.error("Multiple local accounts share username {}; refusing authentication", username);
             }
-            return invalidCredentials();
+            simulatePasswordCheck(password);
+            return result(invalidCredentials());
         }
-        User user = matches.get(0);
+        User user = resolution.user();
+        if (lockoutService.isLocked(user.getId())) {
+            simulatePasswordCheck(password);
+            return locked(user);
+        }
         if (!passwordMatches(user.getPassword(), password)) {
-            return invalidCredentials();
+            lockoutService.recordFailure(user.getId());
+            return result(invalidCredentials());
         }
         return verifySecondFactor(user, SOURCE_LOCAL, otp);
     }
 
-    private LoginResponse verifySecondFactor(User user, String source, String otp) {
+    private Outcome verifySecondFactor(User user, String source, String otp) {
         if (user.getSecret() == null || user.getSecret().isBlank()) {
             synchronized (provisioningLock) {
-                return enroll(user, source);
+                return enrollOutcome(user, source);
             }
         }
         if (otp == null || otp.isBlank()) {
-            return failure(LoginResponse.Status.OTP_REQUIRED, "One-time password is required");
+            return result(failure(LoginResponse.Status.OTP_REQUIRED, "One-time password is required"));
         }
         String code = otp.trim();
         if (!OTP_PATTERN.matcher(code).matches()) {
-            return failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password");
+            if (lockoutService.isLocked(user.getId())) {
+                return locked(user);
+            }
+            lockoutService.recordFailure(user.getId());
+            return result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
         }
-        int codeInt = Integer.parseInt(code);
-        OptionalLong matchingStep = totpService.findMatchingTimeStep(user.getSecret(), codeInt);
-        if (matchingStep.isPresent()) {
-            if (user.getId() != null && !markTimeStepUsed(user.getId(), matchingStep.getAsLong())) {
+        OtpVerificationService.Result verification = otpVerifier.verifyTotp(user, Integer.parseInt(code));
+        switch (verification) {
+            case ACCEPTED:
+                break;
+            case LOCKED:
+                return locked(user);
+            case REPLAYED:
                 log.warn("Rejected replayed TOTP for user {}", user.getUsername());
-                return failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password");
-            }
-        } else {
-            // Fallback for mocks/unit tests that only stub validateOtp
-            if (!totpService.validateOtp(user.getSecret(), codeInt)) {
-                return failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password");
-            }
+                return result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
+            case INVALID:
+            case NOT_ENROLLED:
+            default:
+                return result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
         }
-        return LoginResponse.builder()
+        return result(LoginResponse.builder()
                 .status(LoginResponse.Status.AUTHENTICATED)
                 .authenticated(true)
                 .message("Authentication successful")
                 .userId(user.getId())
                 .username(user.getUsername())
                 .authenticationSource(source)
-                .build();
+                .build());
     }
 
-    private boolean markTimeStepUsed(Long userId, long step) {
-        purgeOldTimeStepsIfDue();
-        boolean[] accepted = {false};
-        lastUsedTimeStep.compute(userId, (id, previous) -> {
-            if (previous == null || step > previous) {
-                accepted[0] = true;
-                return step;
-            }
-            return previous;
-        });
-        return accepted[0];
-    }
-
+    /**
+     * Clears all TOTP replay state used by this service (maintenance / test hook). In a cluster this
+     * affects the shared replay state of every node.
+     */
     public void resetReplayState() {
-        lastUsedTimeStep.clear();
+        otpVerifier.usageStore().clear();
     }
 
-    private void purgeOldTimeStepsIfDue() {
-        long now = System.currentTimeMillis();
-        if (now - lastStepPurgeTime > 30000L) {
-            lastStepPurgeTime = now;
-            long currentStep = now / 30000L;
-            lastUsedTimeStep.entrySet().removeIf(e -> e.getValue() < currentStep - 2);
+    private Outcome enrollOutcome(User user, String source) {
+        LoginResponse response = enroll(user, source);
+        if (response.getStatus() == LoginResponse.Status.ENROLLMENT_REQUIRED && response.getUserId() != null) {
+            // A new secret invalidates anything pending for the account.
+            try {
+                lockoutService.invalidatePendingSessions(response.getUserId());
+                otpVerifier.usageStore().resetOcraChallenges(response.getUserId());
+            } catch (RuntimeException e) {
+                log.error("Unable to invalidate pending sessions after enrollment of {}", user.getUsername(), e);
+            }
         }
+        return result(response);
+    }
+
+    private static Outcome result(LoginResponse response) {
+        return new Outcome(response, false);
+    }
+
+    /**
+     * Locked accounts receive the same response as invalid credentials (no account state disclosure and
+     * no change of the API contract); the audit log records the lockout.
+     */
+    private static Outcome locked(User user) {
+        log.warn("Web login refused for locked-out account '{}'", user.getUsername());
+        return new Outcome(invalidCredentials(), true);
+    }
+
+    private void simulatePasswordCheck(String password) {
+        bcryptEncoder.matches(password, DUMMY_HASH);
     }
 
     private LoginResponse enroll(User user, String source) {

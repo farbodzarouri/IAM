@@ -21,6 +21,19 @@ public interface MfaPreAuthService {
      */
     boolean consumeApproval(String username);
 
+    /**
+     * Atomically consumes a pending, non-expired approval for the given user name, but only if it was
+     * issued for the local account {@code userId}. An approval belonging to another account is left
+     * untouched.
+     */
+    default boolean consumeApproval(String username, Long userId) {
+        return consumeApproval(username);
+    }
+
     /** @return true if a non-expired, unconsumed approval exists (does not consume it). */
     boolean hasActiveApproval(String username);
+
+    /** Discards all pending approvals of an account (lockout, deletion, credential change). */
+    default void invalidateApprovals(Long userId) {
+    }
 }

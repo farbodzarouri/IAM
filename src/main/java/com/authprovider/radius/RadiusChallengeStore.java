@@ -54,15 +54,20 @@ public class RadiusChallengeStore {
     public record ChallengeSession(Long userId, String userName, InetAddress clientAddress, Instant expiresAt) {
     }
 
+    /** Whether sessions are kept in the shared database (as opposed to node-local memory). */
+    public boolean isPersistent() {
+        return repository != null;
+    }
+
     public Optional<byte[]> create(Long userId, String userName, InetAddress clientAddress) {
         SecurityPolicy policy = policyService.current();
         int maxPending = policy.getChallengeMaxPending();
         Instant now = clock.instant();
-        if (pending(now) >= maxPending) {
+        if (size() >= maxPending) {
             purgeExpired();
-            if (pending(now) >= maxPending) {
-                return Optional.empty();
-            }
+        }
+        if (pending(now) >= maxPending) {
+            return Optional.empty();
         }
         Instant expiresAt = now.plus(Duration.ofSeconds(policy.getChallengeTtlSeconds()));
         if (repository == null) {
@@ -97,6 +102,28 @@ public class RadiusChallengeStore {
         return Optional.empty();
     }
 
+    /**
+     * Returns the pending, non-expired session for {@code state} without consuming it, so that a request
+     * that does not match the session (other user or client) leaves the legitimate challenge intact.
+     */
+    public Optional<ChallengeSession> peek(byte[] state) {
+        if (state == null || state.length != STATE_LENGTH) {
+            return Optional.empty();
+        }
+        Instant now = clock.instant();
+        if (repository == null) {
+            ChallengeSession session = sessions.get(key(state));
+            if (session == null || !now.isBefore(session.expiresAt())) {
+                return Optional.empty();
+            }
+            return Optional.of(session);
+        }
+        return repository.findByState(key(state))
+                .filter(entity -> now.isBefore(entity.getExpiresAt()))
+                .map(RadiusChallengeStore::toSession);
+    }
+
+    /** Atomically consumes the session (single use across the cluster). */
     public Optional<ChallengeSession> consume(byte[] state) {
         if (state == null || state.length != STATE_LENGTH) {
             return Optional.empty();
@@ -121,8 +148,24 @@ public class RadiusChallengeStore {
         if (!now.isBefore(entity.getExpiresAt())) {
             return Optional.empty();
         }
-        return Optional.of(new ChallengeSession(entity.getUserId(), entity.getUserName(),
-                parseAddress(entity.getClientAddress()), entity.getExpiresAt()));
+        return Optional.of(toSession(entity));
+    }
+
+    /** Invalidates every pending challenge of an account (lockout, deletion, credential change). */
+    public void invalidateUser(Long userId) {
+        if (userId == null) {
+            return;
+        }
+        if (repository == null) {
+            sessions.values().removeIf(session -> userId.equals(session.userId()));
+            return;
+        }
+        repository.deleteByUserId(userId);
+    }
+
+    private static ChallengeSession toSession(RadiusChallengeSession entity) {
+        return new ChallengeSession(entity.getUserId(), entity.getUserName(),
+                parseAddress(entity.getClientAddress()), entity.getExpiresAt());
     }
 
     public void purgeExpired() {
@@ -143,9 +186,9 @@ public class RadiusChallengeStore {
 
     private long pending(Instant now) {
         if (repository == null) {
-            return sessions.size();
+            return sessions.values().stream().filter(session -> now.isBefore(session.expiresAt())).count();
         }
-        return repository.count();
+        return repository.countByExpiresAtAfter(now);
     }
 
     private byte[] newState() {

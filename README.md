@@ -69,6 +69,11 @@ Used when the client submits an `Access-Request` *with* `User-Password`:
   - Local database passwords are automatically hashed with BCrypt (`$2a$`) upon creation and update.
 - **Directory Bind Throttling (Anti-Lockout)**:
   - In-band RADIUS directory lookups perform domain stripping and execute at most a single user authentication bind per packet. This avoids looping across multiple candidate identities and prevents triggering enterprise Active Directory account lockout policies.
+- **Unified, Cluster-Safe Authentication Boundary**:
+  - *Canonical identity*: every channel (web login, MFA pre-authentication, RADIUS, local fallback) resolves user names with the same rules (`AccountResolver`): exact name first, then the realm-stripped form (`DOMAIN\\user`, `user@realm`); a unique case-insensitive match wins and ambiguous names are refused. Authenticated directory identities are linked by their canonical directory name.
+  - *Shared lockout*: failures from web login (password and OTP), MFA pre-authentication, direct OTP / OCRA validation, in-band RADIUS and **unapproved out-of-band RADIUS requests** are counted against one per-account record (`AccountLockoutService`, persisted in `auth_failure_records`, thresholds from the `default` security policy). Reaching the threshold on any channel locks the account on every channel and node; a successful authentication clears it. Second-factor attempts are reserved *before* verification, so concurrent guesses across nodes cannot exceed the threshold.
+  - *Single-use codes*: all channels verify OTPs through `OtpVerificationService`. Accepted TOTP time steps must be strictly increasing per user (atomic conditional update in `otp_replay_state`), and answered OCRA challenges are single-use (`ocra_challenge_uses`) — across concurrent requests, channels and instances.
+  - *Pending sessions*: a request with a mismatched user or client does not destroy a pending RADIUS challenge, and out-of-band approvals are bound to the approved account. Pending challenges and approvals are invalidated immediately when the account is locked out, deleted, or its password / OTP secret changes.
 - **Multi-Factor Replay Defense**:
   - Both web login and RADIUS MFA record and invalidate consumed TOTP time-step windows to prevent token reuse during replay attacks.
 - **Denial of Service & Memory Bounds**:

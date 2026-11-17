@@ -9,11 +9,14 @@ import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 
 @Repository
 public interface MfaApprovalRepository extends JpaRepository<MfaApproval, Long> {
     Optional<MfaApproval> findByUsername(String username);
+
+    List<MfaApproval> findByUserId(Long userId);
 
     /** Atomically consumes the approval; returns 1 only for the single caller that removed it. */
     @Transactional
@@ -25,6 +28,12 @@ public interface MfaApprovalRepository extends JpaRepository<MfaApproval, Long> 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("delete from MfaApproval a where a.username = :username")
     int deleteByUsername(@Param("username") String username);
+
+    /** Invalidates every pending approval of a user (lockout, deletion, credential change). */
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("delete from MfaApproval a where a.userId = :userId")
+    int deleteByUserId(@Param("userId") Long userId);
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)

@@ -7,6 +7,8 @@ import com.authprovider.ldap.DirectoryAuthenticator;
 import com.authprovider.ldap.DirectoryConfiguration;
 import com.authprovider.ldap.LdapPropertiesDirectoryConfiguration;
 import com.authprovider.repository.UserRepository;
+import com.authprovider.service.AccountResolver;
+import com.authprovider.service.UsernameNormalizer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.IncorrectResultSizeDataAccessException;
@@ -139,7 +141,7 @@ public class PrimaryCredentialVerifier {
             case AUTHENTICATED: {
                 String canonical = result.username() != null && !result.username().isBlank()
                         ? result.username() : loginName;
-                Optional<User> linked = findUser(canonical);
+                Optional<User> linked = findLinkedAccount(canonical);
                 if (linked.isEmpty()) {
                     log.warn("Directory user '{}' has no enrolled local account; complete two-factor enrollment "
                             + "before using RADIUS", RadiusAuthenticationHandler.sanitize(canonical));
@@ -170,15 +172,8 @@ public class PrimaryCredentialVerifier {
     String directoryLoginName(String userName) {
         String name = userName.trim();
         if (properties.isStripRealm()) {
-            int backslash = name.lastIndexOf('\\');
-            if (backslash >= 0) {
-                name = name.substring(backslash + 1);
-            }
-            int at = name.indexOf('@');
-            if (at >= 0) {
-                name = name.substring(0, at);
-            }
-            name = name.trim();
+            String stripped = UsernameNormalizer.stripRealm(name);
+            name = stripped == null ? "" : stripped;
         }
         return name.isEmpty() ? userName.trim() : name;
     }
@@ -191,33 +186,38 @@ public class PrimaryCredentialVerifier {
         return user.getSecret() != null && !user.getSecret().isBlank();
     }
 
+    /**
+     * Resolves a RADIUS user name to the canonical local account using the shared {@link AccountResolver}
+     * rules (identical for web login, MFA pre-authentication and RADIUS). Ambiguous names resolve to nothing.
+     */
     public Optional<User> findUser(String userName) {
-        List<String> candidates = candidateUserNames(userName);
-        for (String candidate : candidates) {
-            Optional<User> user;
-            try {
-                user = userRepository.findByUsername(candidate);
-            } catch (IncorrectResultSizeDataAccessException e) {
-                log.error("Multiple users share the username '{}'; refusing RADIUS authentication",
-                        RadiusAuthenticationHandler.sanitize(candidate));
-                return Optional.empty();
-            }
-            if (user != null && user.isPresent()) {
-                return user;
-            }
+        if (userName == null || userName.isEmpty()) {
+            return Optional.empty();
         }
-        for (String candidate : candidates) {
-            List<User> matches = userRepository.findAllByUsernameIgnoreCase(candidate);
-            if (matches != null && !matches.isEmpty()) {
-                if (matches.size() > 1) {
-                    log.error("Multiple users match username '{}' case-insensitively; refusing RADIUS authentication",
-                            RadiusAuthenticationHandler.sanitize(candidate));
-                    return Optional.empty();
-                }
-                return Optional.of(matches.get(0));
-            }
+        AccountResolver resolver = new AccountResolver(userRepository::findAllByUsernameIgnoreCase, this::findExact);
+        return resolver.resolve(userName, properties.isStripRealm()).asOptional();
+    }
+
+    /**
+     * Links an authenticated directory identity to its local account. The canonical name reported by the
+     * directory is authoritative and is matched as is (no realm stripping), using the same rule as web login.
+     */
+    public Optional<User> findLinkedAccount(String canonicalName) {
+        if (canonicalName == null || canonicalName.isBlank()) {
+            return Optional.empty();
         }
-        return Optional.empty();
+        AccountResolver resolver = new AccountResolver(userRepository::findAllByUsernameIgnoreCase, this::findExact);
+        return resolver.resolve(canonicalName, false).asOptional();
+    }
+
+    private Optional<User> findExact(String candidate) {
+        try {
+            return userRepository.findByUsername(candidate);
+        } catch (IncorrectResultSizeDataAccessException e) {
+            log.error("Multiple users share the username '{}'; refusing RADIUS authentication",
+                    RadiusAuthenticationHandler.sanitize(candidate));
+            return Optional.empty();
+        }
     }
 
     public boolean passwordMatches(User user, byte[] suppliedPassword) {
@@ -248,17 +248,8 @@ public class PrimaryCredentialVerifier {
         Set<String> candidates = new LinkedHashSet<>();
         candidates.add(userName);
         if (properties.isStripRealm()) {
-            String stripped = userName.trim();
-            int backslash = stripped.lastIndexOf('\\');
-            if (backslash >= 0) {
-                stripped = stripped.substring(backslash + 1);
-            }
-            int at = stripped.indexOf('@');
-            if (at >= 0) {
-                stripped = stripped.substring(0, at);
-            }
-            stripped = stripped.trim();
-            if (!stripped.isEmpty()) {
+            String stripped = UsernameNormalizer.stripRealm(userName);
+            if (stripped != null && !stripped.isEmpty()) {
                 candidates.add(stripped);
                 candidates.add(stripped.toLowerCase(Locale.ROOT));
             }

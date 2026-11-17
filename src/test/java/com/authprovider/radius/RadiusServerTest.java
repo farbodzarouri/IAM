@@ -158,6 +158,8 @@ class RadiusServerTest {
     void stateIsBoundToUserName() throws Exception {
         byte[] state = obtainChallenge("alice");
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("bob", "123456", state)).getCode());
+        // The mismatched request must not destroy alice's pending challenge.
+        assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(client.accessRequest("alice", "123456", state)).getCode());
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("alice", "123456", state)).getCode());
     }
 
@@ -168,6 +170,8 @@ class RadiusServerTest {
         RadiusPacket packet = RadiusPacket.decode(request.bytes(), request.bytes().length);
         byte[] response = handler.handle(packet, InetAddress.getByName("10.9.8.7")).orElseThrow();
         assertEquals(ACCESS_REJECT, response[0]);
+        // The request from the wrong client leaves the challenge usable by the legitimate client.
+        assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(client.accessRequest("alice", "123456", state)).getCode());
     }
 
     @Test

@@ -40,12 +40,16 @@ class PersistentStateRestartTest {
         try (ConfigurableApplicationContext first = start("first-secret")) {
             userId = first.getBean(UserRepository.class)
                     .save(User.builder().username("restart-user").password("pw").secret(secret).build()).getId();
+            first.getBean(UserRepository.class)
+                    .save(User.builder().username("approved-user").password("pw").secret(secret).build());
             RadiusAuthGuard guard = first.getBean(RadiusAuthGuard.class);
             guard.recordFailure(userId);
             guard.recordFailure(userId);
             assertTrue(guard.isLocked(userId));
             int otp = first.getBean(TotpService.class).generateOtp(secret);
-            assertTrue(first.getBean(MfaPreAuthService.class).preAuthenticate("restart-user", otp));
+            // The lockout applies to every channel, including MFA pre-authentication.
+            assertFalse(first.getBean(MfaPreAuthService.class).preAuthenticate("restart-user", otp));
+            assertTrue(first.getBean(MfaPreAuthService.class).preAuthenticate("approved-user", otp));
 
             SecurityPolicy policy = first.getBean(SecurityPolicyRepository.class)
                     .findByName(SecurityPolicy.DEFAULT_NAME).orElseThrow();
@@ -54,7 +58,8 @@ class PersistentStateRestartTest {
         }
         try (ConfigurableApplicationContext second = start("second-secret")) {
             assertTrue(second.getBean(RadiusAuthGuard.class).isLocked(userId));
-            assertTrue(second.getBean(MfaPreAuthService.class).consumeApproval("restart-user"));
+            assertFalse(second.getBean(MfaPreAuthService.class).consumeApproval("restart-user"));
+            assertTrue(second.getBean(MfaPreAuthService.class).consumeApproval("approved-user"));
             // An initialized database is not re-seeded: runtime changes are kept.
             assertEquals(77, second.getBean(SecurityPolicyRepository.class)
                     .findByName(SecurityPolicy.DEFAULT_NAME).orElseThrow().getChallengeTtlSeconds());

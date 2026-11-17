@@ -12,6 +12,16 @@ public final class UsernameNormalizer {
     }
 
     public static String normalize(String username) {
+        String stripped = stripRealm(username);
+        if (stripped == null || stripped.isEmpty()) {
+            return null;
+        }
+        String name = stripped.toLowerCase(Locale.ROOT);
+        return name.isEmpty() ? null : name;
+    }
+
+    /** Removes a {@code DOMAIN\\} prefix and an {@code @realm} suffix while preserving case. */
+    public static String stripRealm(String username) {
         if (username == null) {
             return null;
         }
@@ -24,7 +34,6 @@ public final class UsernameNormalizer {
         if (at >= 0) {
             name = name.substring(0, at);
         }
-        name = name.trim().toLowerCase(Locale.ROOT);
-        return name.isEmpty() ? null : name;
+        return name.trim();
     }
 }

@@ -25,6 +25,12 @@ public interface RadiusChallengeSessionRepository extends JpaRepository<RadiusCh
     @Query("delete from RadiusChallengeSession s where s.id = :id")
     int deleteByIdReturningCount(@Param("id") Long id);
 
+    /** Invalidates every pending challenge of a user (lockout, deletion, credential change). */
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("delete from RadiusChallengeSession s where s.userId = :userId")
+    int deleteByUserId(@Param("userId") Long userId);
+
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("delete from RadiusChallengeSession s where s.expiresAt <= :now")

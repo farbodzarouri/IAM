@@ -44,7 +44,7 @@ public class RadiusAuthenticationHandler {
     /** Per-request context: the sending client and its shared secret. */
     private record RequestContext(InetAddress address, String clientName, byte[] secret) {
         String host() {
-            return address.getHostAddress();
+            return address == null ? "unknown" : address.getHostAddress();
         }
     }
 
@@ -86,6 +86,11 @@ public class RadiusAuthenticationHandler {
         this.clientRegistry = clientRegistry;
         this.policyService = policyService;
         this.auditService = auditService == null ? AuthAuditService.noOp() : auditService;
+        if (challengeStore != null && !challengeStore.isPersistent() && authGuard != null
+                && authGuard.getLockoutService() != null) {
+            // Node-local challenges are discarded by this node when the account is locked out.
+            authGuard.getLockoutService().sessionInvalidator().addListener(challengeStore::invalidateUser);
+        }
     }
 
     RadiusClientRegistry getClientRegistry() {
@@ -99,7 +104,8 @@ public class RadiusAuthenticationHandler {
     public Optional<byte[]> handle(RadiusPacket request, InetAddress clientAddress) {
         Optional<RadiusClientRegistry.ResolvedClient> client = clientRegistry.resolve(clientAddress);
         if (client.isEmpty()) {
-            log.warn("Dropping RADIUS packet from unauthorized client {}", clientAddress.getHostAddress());
+            log.warn("Dropping RADIUS packet from unauthorized client {}",
+                    clientAddress == null ? "null" : clientAddress.getHostAddress());
             return Optional.empty();
         }
         return handle(request, clientAddress, client.get());
@@ -205,13 +211,30 @@ public class RadiusAuthenticationHandler {
             audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "OUT_OF_BAND_DISABLED", null);
             return reject(request, context);
         }
-        if (mfaPreAuthService.consumeApproval(userName)) {
+        // Resolve the RADIUS identity to the canonical local account (same rules as every other channel).
+        Optional<User> account = credentialVerifier.findUser(userName);
+        if (account.isEmpty() || account.get().getId() == null) {
+            log.info("RADIUS Access-Reject for user '{}' from {} (unknown account; no MFA approval)", safeUser, client);
+            audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "NO_MFA_APPROVAL", null);
+            return respond(request, context, ACCESS_REJECT,
+                    List.of(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, OUT_OF_BAND_REJECT_MESSAGE)));
+        }
+        Long userId = account.get().getId();
+        if (authGuard.isLocked(userId)) {
+            log.warn("RADIUS authentication refused for locked-out user '{}' from {}", safeUser, client);
+            audit(context, userName, userId, AuthAuditLog.Outcome.LOCKED, "LOCKED_OUT", null);
+            return reject(request, context);
+        }
+        if (mfaPreAuthService.consumeApproval(userName, userId)) {
+            authGuard.recordSuccess(userId);
             log.info("RADIUS Access-Accept for user '{}' from {} (MFA approval consumed)", safeUser, client);
-            audit(context, userName, null, AuthAuditLog.Outcome.SUCCESS, "MFA_APPROVAL_CONSUMED", null);
+            audit(context, userName, userId, AuthAuditLog.Outcome.SUCCESS, "MFA_APPROVAL_CONSUMED", null);
             return respond(request, context, ACCESS_ACCEPT, List.of());
         }
+        // An unapproved out-of-band request is a failed authentication of the account.
+        authGuard.recordFailure(userId);
         log.info("RADIUS Access-Reject for user '{}' from {} (no active MFA approval)", safeUser, client);
-        audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "NO_MFA_APPROVAL", null);
+        audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "NO_MFA_APPROVAL", null);
         return respond(request, context, ACCESS_REJECT,
                 List.of(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, OUT_OF_BAND_REJECT_MESSAGE)));
     }
@@ -276,17 +299,25 @@ public class RadiusAuthenticationHandler {
                                            byte[] state, byte[] password) {
         String client = context.host();
         String safeUser = sanitize(userName);
-        Optional<RadiusChallengeStore.ChallengeSession> consumed = challengeStore.consume(state);
-        if (consumed.isEmpty()) {
+        // Inspect the session without consuming it: a request from another client or for another user must
+        // not destroy the legitimate user's pending challenge.
+        Optional<RadiusChallengeStore.ChallengeSession> pending = challengeStore.peek(state);
+        if (pending.isEmpty()) {
             log.info("RADIUS challenge response from {} for user '{}' has unknown, expired or reused State", client, safeUser);
             audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "INVALID_STATE", null);
             return reject(request, context);
         }
-        RadiusChallengeStore.ChallengeSession session = consumed.get();
+        RadiusChallengeStore.ChallengeSession session = pending.get();
         Long userId = session.userId();
-        if (!Objects.equals(session.clientAddress(), context.address()) || !sameUser(session.userName(), userName)) {
+        if (!Objects.equals(session.clientAddress(), context.address()) || !matchesChallengeUser(session, userName)) {
             log.warn("RADIUS challenge response from {} for user '{}' does not match the issued challenge", client, safeUser);
-            audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "CHALLENGE_MISMATCH", null);
+            audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "CHALLENGE_MISMATCH", null);
+            return reject(request, context);
+        }
+        Optional<RadiusChallengeStore.ChallengeSession> consumed = challengeStore.consume(state);
+        if (consumed.isEmpty() || !Objects.equals(consumed.get().userId(), userId)) {
+            log.info("RADIUS challenge response from {} for user '{}' has unknown, expired or reused State", client, safeUser);
+            audit(context, userName, null, AuthAuditLog.Outcome.FAILURE, "INVALID_STATE", null);
             return reject(request, context);
         }
         if (authGuard.isLocked(userId)) {
@@ -301,14 +332,19 @@ public class RadiusAuthenticationHandler {
             audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "MALFORMED_OTP", null);
             return reject(request, context);
         }
+        // When the OTP service enforces the shared account protections itself (lockout reservation,
+        // failure accounting, single-use time steps, clearing on success) the outcome is not recorded twice.
+        boolean selfAccounting = userOtpService.enforcesAccountProtection();
         boolean valid = userOtpService.validateUserOtp(userId, Integer.parseInt(otp)).orElse(false);
         if (!valid) {
-            authGuard.recordFailure(userId);
+            if (!selfAccounting) {
+                authGuard.recordFailure(userId);
+            }
             log.info("RADIUS OTP verification failed for user '{}' from {}", safeUser, client);
             audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "INVALID_OTP", null);
             return reject(request, context);
         }
-        if (!authGuard.markOtpUsed(userId, otp)) {
+        if (!selfAccounting && !authGuard.markOtpUsed(userId, otp)) {
             authGuard.recordFailure(userId);
             log.warn("RADIUS OTP replay detected for user '{}' from {}", safeUser, client);
             audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "OTP_REPLAY", null);
@@ -318,6 +354,16 @@ public class RadiusAuthenticationHandler {
         log.info("RADIUS authentication succeeded for user '{}' from {}", safeUser, client);
         audit(context, userName, userId, AuthAuditLog.Outcome.SUCCESS, "AUTHENTICATED", null);
         return respond(request, context, ACCESS_ACCEPT, List.of());
+    }
+
+    private boolean matchesChallengeUser(RadiusChallengeStore.ChallengeSession session, String requestUser) {
+        if (credentialVerifier != null && session.userId() != null) {
+            Optional<User> resolved = credentialVerifier.findUser(requestUser);
+            if (resolved.isPresent()) {
+                return Objects.equals(resolved.get().getId(), session.userId());
+            }
+        }
+        return sameUser(session.userName(), requestUser);
     }
 
     private boolean sameUser(String sessionUser, String requestUser) {
