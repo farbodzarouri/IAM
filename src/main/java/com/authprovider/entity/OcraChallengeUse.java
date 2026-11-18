@@ -18,7 +18,7 @@ import java.time.Instant;
 @AllArgsConstructor
 @Entity
 @Table(name = "ocra_challenge_uses", uniqueConstraints = {
-        @UniqueConstraint(name = "uk_ocra_challenge_uses_user_challenge", columnNames = {"user_id", "challenge_hash"})
+        @UniqueConstraint(name = "uk_ocra_challenge_uses_subject_challenge", columnNames = {"subject_key", "challenge_hash"})
 })
 public class OcraChallengeUse {
 
@@ -26,7 +26,10 @@ public class OcraChallengeUse {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "user_id", nullable = false)
+    @Column(name = "subject_key", nullable = false, length = 64)
+    private String subjectKey;
+
+    @Column(name = "user_id")
     private Long userId;
 
     /** Hex encoded SHA-256 of the challenge. */

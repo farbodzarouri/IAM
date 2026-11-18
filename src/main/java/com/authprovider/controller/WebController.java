@@ -1,6 +1,8 @@
 package com.authprovider.controller;
 
+import com.authprovider.dto.UserRequest;
 import com.authprovider.entity.User;
+import com.authprovider.service.OtpProvisioningSupport;
 import com.authprovider.service.QrCodeGenerator;
 import com.authprovider.service.UserOtpService;
 import com.authprovider.service.UserService;
@@ -18,9 +20,6 @@ import org.springframework.web.bind.annotation.PostMapping;
 @Controller
 public class WebController {
 
-    private static final String ISSUER = "IAM";
-    private static final int QR_CODE_SIZE = 200;
-
     private final UserService userService;
     private final UserOtpService userOtpService;
     private final QrCodeGenerator qrCodeGenerator;
@@ -30,11 +29,6 @@ public class WebController {
         return "redirect:/users";
     }
 
-    @GetMapping("/login")
-    public String login() {
-        return "login";
-    }
-
     @GetMapping("/users")
     public String users(Model model) {
         model.addAttribute("users", userService.getAllUsers());
@@ -42,8 +36,8 @@ public class WebController {
     }
 
     @PostMapping("/users/add")
-    public String addUser(@ModelAttribute User user) {
-        userService.saveUser(user);
+    public String addUser(@ModelAttribute UserRequest request) {
+        userService.createUser(request);
         return "redirect:/users";
     }
 
@@ -58,9 +52,8 @@ public class WebController {
     }
 
     @PostMapping("/users/edit/{id}")
-    public String editUserSubmit(@PathVariable("id") Long id, @ModelAttribute User user) {
-        user.setId(id);
-        userService.saveUser(user);
+    public String editUserSubmit(@PathVariable("id") Long id, @ModelAttribute UserRequest request) {
+        userService.updateUser(id, request);
         return "redirect:/users";
     }
 
@@ -75,10 +68,10 @@ public class WebController {
         User user = userService.getUserById(id);
         model.addAttribute("user", user);
         if (user != null && user.getSecret() != null) {
-            String otpAuthUrl = qrCodeGenerator.generateOtpAuthUrl(ISSUER, user.getUsername(), user.getSecret());
             try {
-                String qrCodeImage = qrCodeGenerator.generateQrCodeImage(otpAuthUrl, QR_CODE_SIZE, QR_CODE_SIZE);
-                model.addAttribute("qrCode", qrCodeImage);
+                OtpProvisioningSupport.ProvisioningQr qr = OtpProvisioningSupport.generate(
+                        qrCodeGenerator, user.getUsername(), user.getSecret());
+                model.addAttribute("qrCode", qr.qrCode());
             } catch (Exception e) {
                 log.error("Failed to generate QR code for user {}", id, e);
             }

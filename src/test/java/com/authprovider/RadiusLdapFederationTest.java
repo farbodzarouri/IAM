@@ -41,9 +41,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @SpringBootTest(properties = {
         "radius.port=18128",
-        "radius.shared-secret=testing123",
-        "radius.shared.secret=testing123",
-        "radius.challenge.ttl-seconds=10",
+        "iam.bootstrap.radius.shared-secret=testing123",
+        "iam.bootstrap.policy.challenge-ttl-seconds=10",
         "ldap.enabled=true",
         "ldap.base-dn=dc=example,dc=org",
         "ldap.user-search-filter=(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))",

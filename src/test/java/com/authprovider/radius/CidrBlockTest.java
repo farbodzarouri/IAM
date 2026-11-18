@@ -45,7 +45,7 @@ class CidrBlockTest {
                 RadiusClient.builder().id(2L).name("lan").address("10.0.0.0/8").sharedSecret("lan").active(true).build(),
                 RadiusClient.builder().id(3L).name("nps").address("10.0.0.5").sharedSecret("nps").active(true).build(),
                 RadiusClient.builder().id(4L).name("broken").address("not-an-ip").sharedSecret("x").active(true).build()));
-        RadiusClientRegistry registry = new RadiusClientRegistry(new RadiusProperties(), repository);
+        RadiusClientRegistry registry = new RadiusClientRegistry(repository);
 
         assertEquals("nps", registry.resolve(InetAddress.getByName("10.0.0.5")).orElseThrow().name());
         assertArrayEquals("lan".getBytes(StandardCharsets.UTF_8),

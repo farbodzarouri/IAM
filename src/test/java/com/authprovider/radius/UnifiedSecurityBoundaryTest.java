@@ -18,6 +18,7 @@ import com.authprovider.service.LoginService;
 import com.authprovider.service.MfaPreAuthService;
 import com.authprovider.service.MfaPreAuthServiceImpl;
 import com.authprovider.service.OcraService;
+import com.authprovider.service.OtpVerificationService;
 import com.authprovider.service.SecurityPolicyService;
 import com.authprovider.service.TotpService;
 import com.authprovider.service.TotpServiceImpl;
@@ -45,9 +46,9 @@ import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest(properties = {
         "radius.port=0",
         "radius.bind-address=127.0.0.1",
-        "radius.shared-secret=unified-secret",
-        "radius.max-failures=3",
-        "radius.lockout-seconds=120"
+        "iam.bootstrap.radius.shared-secret=unified-secret",
+        "iam.bootstrap.policy.max-failures=3",
+        "iam.bootstrap.policy.lockout-seconds=120"
 })
 class UnifiedSecurityBoundaryTest {
 
@@ -70,6 +71,7 @@ class UnifiedSecurityBoundaryTest {
     @Autowired private SecurityPolicyService policyService;
     @Autowired private AuthFailureStore failureStore;
     @Autowired private AuthAuditService auditService;
+    @Autowired private OtpVerificationService otpVerificationService;
     @Autowired private PlatformTransactionManager transactionManager;
     @Autowired private Clock clock;
 
@@ -153,10 +155,10 @@ class UnifiedSecurityBoundaryTest {
     @Test
     void concurrentOtpUseAcrossNodesAcceptsExactlyOne() throws Exception {
         int code = Integer.parseInt(otp());
-        MfaPreAuthServiceImpl nodeA = new MfaPreAuthServiceImpl(userService, totpService, clock, policyService,
-                failureStore, approvalRepository, transactionManager, auditService);
-        MfaPreAuthServiceImpl nodeB = new MfaPreAuthServiceImpl(userService, totpService, clock, policyService,
-                failureStore, approvalRepository, transactionManager, auditService);
+        MfaPreAuthServiceImpl nodeA = new MfaPreAuthServiceImpl(userService, clock, policyService,
+                failureStore, approvalRepository, transactionManager, auditService, otpVerificationService);
+        MfaPreAuthServiceImpl nodeB = new MfaPreAuthServiceImpl(userService, clock, policyService,
+                failureStore, approvalRepository, transactionManager, auditService, otpVerificationService);
         ExecutorService pool = Executors.newFixedThreadPool(8);
         CountDownLatch start = new CountDownLatch(1);
         List<Future<Boolean>> results = new ArrayList<>();

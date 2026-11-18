@@ -24,7 +24,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest(properties = {
         "radius.port=0",
         "radius.bind-address=127.0.0.1",
-        "radius.shared-secret=ldap-radius-secret",
+        "iam.bootstrap.radius.shared-secret=ldap-radius-secret",
         "ldap.enabled=true",
         "ldap.base-dn=dc=example,dc=org",
         "ldap.user-search-filter=(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))",

@@ -4,15 +4,19 @@
     <title>Login</title>
 </head>
 <body>
-<h1>Login</h1>
-<form th:action="@{/login}" method="post">
+<h1>Administrator Login</h1>
+<p th:if="${param.error}" style="color:red">Invalid credentials or account locked.</p>
+<p th:if="${param.expired}" style="color:orange">Verification session expired. Please sign in again.</p>
+<p th:if="${param.logout}" style="color:green">You have been signed out.</p>
+<p th:if="${param.setupComplete}" style="color:green">Initial setup completed. Please sign in.</p>
+<form th:action="@{/login}" method="post" autocomplete="off">
     <div>
         <label>User Name :</label>
-        <input type="text" name="username"/>
+        <input type="text" name="username" required/>
     </div>
     <div>
         <label>Password:</label>
-        <input type="password" name="password"/>
+        <input type="password" name="password" required/>
     </div>
     <div>
         <input type="submit" value="Sign In"/>

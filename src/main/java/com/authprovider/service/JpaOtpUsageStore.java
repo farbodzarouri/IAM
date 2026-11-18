@@ -41,18 +41,67 @@ public class JpaOtpUsageStore implements OtpUsageStore {
 
     @Override
     public boolean consumeTimeStep(Long userId, long timeStep) {
-        if (userId == null) {
-            return false;
+        return userId != null && consumeTimeStepBySubject(userKey(userId), userId, timeStep);
+    }
+
+    @Override
+    public boolean consumeTokenTimeStep(Long tokenId, long timeStep) {
+        return tokenId != null && consumeTimeStepBySubject(tokenKey(tokenId), null, timeStep);
+    }
+
+    @Override
+    public boolean consumeOcraChallenge(Long userId, String challenge) {
+        return userId != null && consumeOcraChallengeBySubject(userKey(userId), userId, challenge);
+    }
+
+    @Override
+    public boolean consumeTokenOcraChallenge(Long tokenId, String challenge) {
+        return tokenId != null && consumeOcraChallengeBySubject(tokenKey(tokenId), null, challenge);
+    }
+
+    @Override
+    public void resetOcraChallenges(Long userId) {
+        if (userId != null) {
+            ocraRepository.deleteBySubjectKey(userKey(userId));
         }
+    }
+
+    @Override
+    public void resetTokenOcraChallenges(Long tokenId) {
+        if (tokenId != null) {
+            ocraRepository.deleteBySubjectKey(tokenKey(tokenId));
+        }
+    }
+
+    @Override
+    public void forgetUser(Long userId) {
+        if (userId != null) {
+            String key = userKey(userId);
+            replayRepository.deleteBySubjectKey(key);
+            ocraRepository.deleteBySubjectKey(key);
+        }
+    }
+
+    @Override
+    public void forgetToken(Long tokenId) {
+        if (tokenId != null) {
+            String key = tokenKey(tokenId);
+            replayRepository.deleteBySubjectKey(key);
+            ocraRepository.deleteBySubjectKey(key);
+        }
+    }
+
+    private boolean consumeTimeStepBySubject(String subjectKey, Long userId, long timeStep) {
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            if (replayRepository.advance(userId, timeStep, clock.instant()) == 1) {
+            if (replayRepository.advance(subjectKey, timeStep, clock.instant()) == 1) {
                 return true;
             }
-            if (replayRepository.existsByUserId(userId)) {
+            if (replayRepository.existsBySubjectKey(subjectKey)) {
                 return false;
             }
             try {
                 requiresNew.executeWithoutResult(status -> replayRepository.saveAndFlush(OtpReplayState.builder()
+                        .subjectKey(subjectKey)
                         .userId(userId)
                         .lastTimeStep(timeStep)
                         .updatedAt(clock.instant())
@@ -60,23 +109,23 @@ public class JpaOtpUsageStore implements OtpUsageStore {
                 return true;
             } catch (DataIntegrityViolationException e) {
                 // Another request created the row concurrently; retry the conditional update.
-                log.debug("Concurrent first OTP use for user id {} (attempt {})", userId, attempt + 1);
+                log.debug("Concurrent first OTP use for subject {} (attempt {})", subjectKey, attempt + 1);
             }
         }
         return false;
     }
 
-    @Override
-    public boolean consumeOcraChallenge(Long userId, String challenge) {
-        if (userId == null || challenge == null) {
+    private boolean consumeOcraChallengeBySubject(String subjectKey, Long userId, String challenge) {
+        if (challenge == null) {
             return false;
         }
         String hash = InMemoryOtpUsageStore.hash(challenge);
-        if (ocraRepository.existsByUserIdAndChallengeHash(userId, hash)) {
+        if (ocraRepository.existsBySubjectKeyAndChallengeHash(subjectKey, hash)) {
             return false;
         }
         try {
             requiresNew.executeWithoutResult(status -> ocraRepository.saveAndFlush(OcraChallengeUse.builder()
+                    .subjectKey(subjectKey)
                     .userId(userId)
                     .challengeHash(hash)
                     .usedAt(clock.instant())
@@ -87,19 +136,12 @@ public class JpaOtpUsageStore implements OtpUsageStore {
         }
     }
 
-    @Override
-    public void resetOcraChallenges(Long userId) {
-        if (userId != null) {
-            ocraRepository.deleteByUserId(userId);
-        }
+    private static String userKey(Long userId) {
+        return "USER:" + userId;
     }
 
-    @Override
-    public void forgetUser(Long userId) {
-        if (userId != null) {
-            replayRepository.deleteByUserId(userId);
-            ocraRepository.deleteByUserId(userId);
-        }
+    private static String tokenKey(Long tokenId) {
+        return "TOKEN:" + tokenId;
     }
 
     @Override

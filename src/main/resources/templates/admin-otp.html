@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Admin Two-Factor Verification</title>
+</head>
+<body>
+<h1>Administrator Two-Factor Verification</h1>
+<p>Enter the 6-digit code from your authenticator app for <strong th:text="${username}">admin</strong>.</p>
+<p th:if="${error != null}" th:text="${error}" style="color:red">Error</p>
+<form th:action="@{/login/otp}" method="post" autocomplete="off">
+    <div>
+        <label for="otp">One-time code:</label>
+        <input type="text" id="otp" name="otp" inputmode="numeric" pattern="[0-9]*" maxlength="6" required autofocus/>
+    </div>
+    <div>
+        <button type="submit">Verify</button>
+    </div>
+</form>
+<p><a th:href="@{/login}">Back to Login</a></p>
+</body>
+</html>

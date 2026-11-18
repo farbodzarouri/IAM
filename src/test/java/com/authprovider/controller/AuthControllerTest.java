@@ -32,7 +32,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest
 @AutoConfigureMockMvc
-@TestPropertySource(properties = {"ldap.enabled=true", "ldap.fallback-to-local=false", "ldap.auto-provision=true"})
+@TestPropertySource(properties = {
+        "ldap.enabled=true",
+        "ldap.url=ldap://127.0.0.1:389",
+        "ldap.base-dn=dc=example,dc=org",
+        "ldap.fallback-to-local=false",
+        "ldap.auto-provision=true"
+})
 public class AuthControllerTest {
 
     private static final String DN = "uid=alice,ou=people,dc=example,dc=org";

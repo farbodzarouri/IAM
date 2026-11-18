@@ -11,9 +11,12 @@ import org.springframework.http.MediaType;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.util.List;
+
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @SpringBootTest
@@ -28,32 +31,52 @@ public class OtpControllerTest {
 
     @Test
     @WithMockUser
-    public void testGenerateSecret() throws Exception {
+    public void testGenerateSecretByUsername() throws Exception {
         User user = new User();
         user.setId(1L);
         user.setUsername("testuser");
 
-        when(userService.getUserById(1L)).thenReturn(user);
+        when(userService.findAllByUsernameIgnoreCase("testuser")).thenReturn(List.of(user));
         when(userService.saveUser(any(User.class))).thenReturn(user);
 
-        mockMvc.perform(post("/v1/api/otp/generate/1"))
+        mockMvc.perform(post("/v1/api/otp/generate/testuser"))
                 .andExpect(status().isOk());
     }
 
     @Test
     @WithMockUser
+    public void testGenerateSecret_NotFound() throws Exception {
+        when(userService.findAllByUsernameIgnoreCase("missing")).thenReturn(List.of());
+
+        mockMvc.perform(post("/v1/api/otp/generate/missing"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
     public void testValidateOtp_NoSecret() throws Exception {
         User user = new User();
         user.setId(1L);
-        // No secret
+        user.setUsername("testuser");
 
-        when(userService.getUserById(1L)).thenReturn(user);
+        when(userService.findAllByUsernameIgnoreCase("testuser")).thenReturn(List.of(user));
 
-        String json = "{\"userId\": 1, \"otp\": 123456}";
+        String json = "{\"username\": \"testuser\", \"otp\": \"123456\"}";
 
         mockMvc.perform(post("/v1/api/otp/validate")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(json))
-                .andExpect(status().isBadRequest());
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.valid").value(false))
+                .andExpect(jsonPath("$.status").value("NOT_ENROLLED"));
+    }
+
+    @Test
+    public void testValidateOtp_InvalidPayload() throws Exception {
+        mockMvc.perform(post("/v1/api/otp/validate")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"username\": \"testuser\", \"otp\": \"not-digits\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.valid").value(false))
+                .andExpect(jsonPath("$.status").value("INVALID_REQUEST"));
     }
 }

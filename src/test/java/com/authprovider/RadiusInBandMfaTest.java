@@ -28,9 +28,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @SpringBootTest(properties = {
         "radius.port=18126",
-        "radius.shared-secret=testing123",
-        "radius.shared.secret=testing123",
-        "radius.challenge.ttl-seconds=3"
+        "iam.bootstrap.radius.shared-secret=testing123",
+        "iam.bootstrap.policy.challenge-ttl-seconds=3"
 })
 @AutoConfigureMockMvc
 public class RadiusInBandMfaTest {

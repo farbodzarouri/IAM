@@ -1,177 +1,200 @@
 # Identity & Access Management (IAM) Provider
 
-A modular identity, access management, and multi-factor authentication (MFA) service built with Spring Boot and standard Java SE cryptography. The service provides local and federated identity verification, time-based one-time passwords (TOTP), RFC 6287 challenge-response (OCRA), web login with Just-In-Time (JIT) provisioning, and RADIUS integration for enterprise Remote Desktop Gateway (RDG) and VPN multi-factor authentication.
+A modular identity, access management, and multi-factor authentication (MFA) service built with Spring Boot 3.2 (Java 21) and standard Java SE cryptography. The platform models natural identities (`Person`), hardware/software second-factor tokens (`OtpToken`), separated regular vs. administrative principals (`User` and `Admin`), local BCrypt and federated LDAP / Active Directory authentication, time-based OTP (`RFC 6238` TOTP), challenge-response (`RFC 6287` OCRA), and an embedded `RFC 2865` / `RFC 3579` RADIUS server for VPN and Remote Desktop Gateway (RDG) authentication.
 
 ---
 
 ## Core Capabilities
 
-- **Primary Authentication**: Local database credential verification (BCrypt hashed) and LDAP / Active Directory federation (via native JNDI).
-- **Multi-Factor Authentication**:
-  - Time-Based One-Time Password (TOTP, RFC 6238) with clock-drift window matching and replay rejection.
-  - OATH Challenge-Response Algorithm (OCRA, RFC 6287) with constant-time verification.
-  - QR Code generation (`otpauth://`) for Google Authenticator, Microsoft Authenticator, and standard RFC 6238 apps.
-- **Enterprise RADIUS Server**: RFC 2865 authentication server supporting both in-band challenge-response MFA and out-of-band RD Gateway pre-authentication.
-- **Security Hardening**: Protected administrative APIs, write-only credential serialization, brute-force lockout protections, bounded memory caches, and directory bind throttling to prevent Active Directory account lockouts.
+- **Natural Identity & Privilege Separation**:
+  - `Person` represents a human identity owning one or more `OtpToken` generators, acting as a single enable/disable kill-switch across all linked accounts.
+  - Regular `User` accounts and privileged `Admin` accounts stay strictly isolated — same-person User/Admin pairs cannot reuse primary usernames or passwords (`CredentialConflictChecker`), and directory routing separates `userEnabled` vs. `adminEnabled` LDAP directories.
+  - Multiple accounts owned by the same `Person` can share an `OtpToken` with token-scoped single-use replay protection.
+- **Primary Authentication & Password Service**:
+  - Centralized `PasswordService` handles BCrypt hashing (`$2a$`) in the service layer, supports `{bcrypt}` / `{noop}` forms for legacy fixtures, and equalizes response timing for unknown or locked accounts using dummy BCrypt verification.
+  - Federated LDAP / Active Directory authentication (`FederatedDirectoryAuthenticator` / `JndiLdapDirectoryAuthenticator`) with realm-based routing (`REALM\user`, `user@realm`), priority ordering, and per-directory Just-In-Time (JIT) provisioning or local fallback.
+- **Multi-Factor Authentication & Configurable Auth Modes**:
+  - Four configurable `AuthMode`s (`PASSWORD_AND_OTP`, `PASSWORD_AND_OTP_INLINE`, `PASSWORD_ONLY`, `OTP_ONLY`) resolved across `SecurityPolicy`, per-client `RadiusClient`, and per-account `User` overrides (without downgrading strict `PASSWORD_AND_OTP` accounts; `Admin` accounts always require two-factor verification).
+  - RFC 6238 TOTP with clock-drift window matching, RFC 6287 OCRA constant-time challenge-response, and `otpauth://` QR provisioning (`OtpProvisioningSupport`).
+- **Embedded Enterprise RADIUS Server**:
+  - RFC 2865 / RFC 3579 UDP authentication server (`RadiusServer`, `RadiusAuthenticationHandler`) supporting Out-of-Band RDG pre-authentication, In-Band `Access-Challenge` (`State`), Inline `<password><6-digit-otp>`, `OTP_ONLY`, `PASSWORD_ONLY`, and `Status-Server` health checks.
+- **Day-0 Setup & Database-Managed Runtime Configuration**:
+  - Interactive first-run `/setup` wizard and `/v1/api/setup/**` endpoints active only before initial `Admin` creation or Admin LDAP setup, locking permanently once completed.
+  - All security policies, NAS/NPS clients, LDAP directories, lockouts, OTP replay state, and append-only audit records are stored in the database for cluster-safe operation.
 
 ---
 
-## Authentication Flows
+## Identity Model & Authentication Flows
 
-### 1. Unified Web & REST Login (`/v1/api/auth/login`)
+### 1. Day-0 First-Run `/setup` Flow
+When the database has no `Admin` accounts and no enabled Admin `LdapDirectory`:
+- Browser requests to `/login` automatically redirect to `/setup`, and `GET /v1/api/setup/status` returns `{"setupRequired": true}`.
+- Administrators bootstrap the instance by either:
+  - Creating the initial local admin (`POST /setup/admin` or `POST /v1/api/setup/admin`), or
+  - Registering an Admin LDAP directory (`POST /setup/ldap` or `POST /v1/api/setup/ldap`).
+- As soon as setup completes, `/setup` redirects to `/login` and `/v1/api/setup/**` permanently reject further requests with HTTP `403`.
 
-The primary web login endpoint coordinates directory federation, JIT enrollment, and two-factor verification:
-
+### 2. Unified User Login (`POST /v1/api/auth/login`)
+`LoginServiceImpl` evaluates authentication using the effective `AuthMode` (`User.authMode` -> `SecurityPolicy.defaultAuthMode`):
 1. **Primary Verification**:
-   - If LDAP is enabled (`ldap.enabled=true`), credentials are authenticated against the directory. If the user is not found and `ldap.fallback-to-local=true`, local database credentials are checked.
-   - If LDAP is disabled, credentials are authenticated against local BCrypt hashes.
-2. **MFA Enrollment (First-Time Users)**:
-   - If the account has no 2FA secret enrolled, a secret is generated, persisted, and returned along with an `otpauth://` URI and Base64-encoded QR code (`Status: ENROLLMENT_REQUIRED`).
-3. **MFA Verification (Subsequent Logins)**:
-   - When a user submits their username, password, and OTP code, the code is validated within the drift window.
-   - **Replay Defense**: Once an OTP time step is consumed, subsequent re-use of the exact same code within the 90-second window is rejected.
+   - In `OTP_ONLY` mode (without a password), authenticates directly against the user's enrolled TOTP secret.
+   - In `PASSWORD_AND_OTP_INLINE` mode, splits the trailing 6 digits of `password` into primary password + TOTP when a separate `otp` field is omitted.
+   - If LDAP is enabled (`ldap_directories` with `enabled=true` and `userEnabled=true`), routes qualified names by realm or evaluates directories in priority order, with configurable JIT provisioning (`autoProvision`) or fallback to local BCrypt hashes (`fallbackToLocal`).
+2. **MFA Enrollment (`ENROLLMENT_REQUIRED`)**:
+   - Unenrolled password accounts (except `PASSWORD_ONLY`) automatically receive a new Base32 secret, `otpauth://` URI, and Base64 PNG QR code while invalidating stale pending sessions.
+3. **MFA Verification (`AUTHENTICATED` / `OTP_REQUIRED`)**:
+   - Validates TOTP within the drift window via `OtpVerificationService` and rejects replayed or out-of-order time steps.
+
+### 3. Admin Login & Two-Step Web UI (`/login`, `POST /v1/api/admin/auth/login`)
+- Administrators always authenticate under strict two-factor `PASSWORD_AND_OTP` rules via `AdminLoginServiceImpl` against local BCrypt hashes or `adminEnabled` LDAP directories (`IamAdminUserDetailsService` backs Spring Security).
+- Browser login (`AdminWebAuthController`) uses CSRF-protected two-step verification with session ID rotation:
+  1. `POST /login` verifies primary credentials and stores a short-lived (120s) pending state without creating an authenticated session.
+  2. Unenrolled admins confirm their generated TOTP secret on `/login/enroll`; enrolled admins submit TOTP on `/login/otp` before receiving `ROLE_ADMIN` session access.
+
+### 4. Username-Based OTP & OCRA Validation (`/v1/api/otp/*`)
+- Public validation endpoints (`POST /v1/api/otp/validate`, `POST /v1/api/otp/validate-ocra`) resolve accounts by presented `username` (including realm stripping when configured) rather than internal database IDs, returning structured `OtpValidationResponse` statuses (`VALID`, `INVALID_OTP`, `LOCKED`, `NOT_ENROLLED`, `INVALID_REQUEST`) and writing `OTP_VALIDATION` audit records.
+- Secret generation/rotation (`POST /v1/api/otp/generate` and `POST /v1/api/otp/generate/{username}`) requires authentication and immediately invalidates pending MFA approvals and RADIUS challenges.
+
+### 5. Remote Desktop Gateway / RADIUS MFA
+The RADIUS server listens on UDP (`radius.port`, default `1812`) and authorizes packets using the most specific matching active CIDR entry in `radius_clients`:
+- **Out-of-Band Pre-Authentication** (when `Access-Request` omits `User-Password` and `mfaOutOfBandEnabled=true`):
+  - User approves 2FA via `GET`/`POST /mfa` or `POST /v1/api/mfa/preauth`.
+  - RADIUS atomically consumes the single-use `MfaApproval` and returns `Access-Accept` (or `Access-Reject` if absent/expired/locked).
+- **In-Band Challenge-Response** (`PASSWORD_AND_OTP`, RFC 2865):
+  - Step 1 validates primary credentials and returns `Access-Challenge` with a cryptographic `State` token and `Reply-Message` prompt; Step 2 consumes `State` (bound to user and client IP) and validates TOTP.
+- **Inline MFA (`PASSWORD_AND_OTP_INLINE`)**, **`PASSWORD_ONLY`**, and **`OTP_ONLY`**:
+  - Applied per `RadiusClient.authMode` or `SecurityPolicy.defaultAuthMode` (`User.authMode` cannot be downgraded from `PASSWORD_AND_OTP` to `PASSWORD_ONLY` by a client policy).
+- **Diagnostics**: `Status-Server` (code `12`) with a valid RFC 3579 `Message-Authenticator` returns `Access-Accept`.
 
 ---
 
-### 2. Remote Desktop Gateway / RADIUS MFA
+## Security Architecture
 
-The service acts as an MFA back-end for Windows Remote Desktop Gateway, Network Policy Server (NPS), and VPN gateways. The RADIUS server supports two concurrent operational modes:
-
-#### Mode A: Out-of-band Web Pre-Authentication
-Used when the client (e.g. Windows RD Gateway) forwards an `Access-Request` *without* `User-Password` after Active Directory validates primary credentials:
-
-1. Before connecting, the user pre-authenticates their second factor:
-   - Web interface: `GET /mfa` → submit username and OTP code.
-   - REST endpoint: `POST /v1/api/mfa/preauth` with `{"username": "alice", "otp": 123456}`.
-2. When approved, a single-use approval is persisted (`mfa_approvals`) for the security policy's MFA approval TTL (seeded from `radius.mfa.ttl-seconds`).
-3. When NPS sends an `Access-Request`, the server consumes the active approval and returns `Access-Accept`. If unapproved or expired, it returns `Access-Reject`.
-
-#### Mode B: In-band Challenge-Response (RFC 2865)
-Used when the client submits an `Access-Request` *with* `User-Password`:
-
-1. **Step 1 (Primary Credentials)**:
-   - Client sends `Access-Request` with username and primary password.
-   - Server verifies credentials against LDAP or local store. Non-enrolled users receive `Access-Reject` with `Reply-Message: MFA enrollment required`.
-   - Enrolled users receive `Access-Challenge` containing an OTP prompt and a single-use cryptographic `State` attribute.
-2. **Step 2 (Second Factor Verification)**:
-   - Client submits a second `Access-Request` containing the OTP code as `User-Password` and echoing the `State` attribute.
-   - Server validates the OTP and answers `Access-Accept` or `Access-Reject`.
-
----
-
-## Security Architecture & Audit Remediations
-
-- **Access Control & Information Exposure**:
-  - Administrative endpoints (`/users/**`, `/v1/api/users/**`) and secret generation (`/v1/api/otp/generate/**`) require authentication (HTTP Basic or form login).
-  - Public endpoints are strictly limited to `/login`, `/mfa`, `/v1/api/auth/**`, `/v1/api/mfa/**`, and OTP verification.
-  - User entity JSON serialization marks `password` and `secret` as `@JsonProperty(access = WRITE_ONLY)`, preventing credential leakage in API responses.
-- **Credential Storage**:
-  - Local database passwords are automatically hashed with BCrypt (`$2a$`) upon creation and update.
-- **Directory Bind Throttling (Anti-Lockout)**:
-  - In-band RADIUS directory lookups perform domain stripping and execute at most a single user authentication bind per packet. This avoids looping across multiple candidate identities and prevents triggering enterprise Active Directory account lockout policies.
-- **Unified, Cluster-Safe Authentication Boundary**:
-  - *Canonical identity*: every channel (web login, MFA pre-authentication, RADIUS, local fallback) resolves user names with the same rules (`AccountResolver`): exact name first, then the realm-stripped form (`DOMAIN\\user`, `user@realm`); a unique case-insensitive match wins and ambiguous names are refused. Authenticated directory identities are linked by their canonical directory name.
-  - *Shared lockout*: failures from web login (password and OTP), MFA pre-authentication, direct OTP / OCRA validation, in-band RADIUS and **unapproved out-of-band RADIUS requests** are counted against one per-account record (`AccountLockoutService`, persisted in `auth_failure_records`, thresholds from the `default` security policy). Reaching the threshold on any channel locks the account on every channel and node; a successful authentication clears it. Second-factor attempts are reserved *before* verification, so concurrent guesses across nodes cannot exceed the threshold.
-  - *Single-use codes*: all channels verify OTPs through `OtpVerificationService`. Accepted TOTP time steps must be strictly increasing per user (atomic conditional update in `otp_replay_state`), and answered OCRA challenges are single-use (`ocra_challenge_uses`) — across concurrent requests, channels and instances.
-  - *Pending sessions*: a request with a mismatched user or client does not destroy a pending RADIUS challenge, and out-of-band approvals are bound to the approved account. Pending challenges and approvals are invalidated immediately when the account is locked out, deleted, or its password / OTP secret changes.
-- **Multi-Factor Replay Defense**:
-  - Both web login and RADIUS MFA record and invalidate consumed TOTP time-step windows to prevent token reuse during replay attacks.
-- **Denial of Service & Memory Bounds**:
-  - The persistent MFA pre-authentication failure tracking is bounded to 10,000 active records with automatic eviction of expired entries.
-  - Accepted TOTP time-step records are pruned past the clock-drift window.
-- **Identity Collision**:
-  - The user database schema enforces unique constraints on usernames with case-insensitive collision detection during provisioning.
-- **Cryptographic Timing**:
-  - OCRA challenge-response validation utilizes constant-time byte comparisons (`MessageDigest.isEqual`) to eliminate micro-timing side-channels.
+- **Master Kill-Switch (`Person.enabled`)**: Disabling a `Person` immediately invalidates pending RADIUS challenges and MFA approvals and blocks all linked `User` and `Admin` logins across every channel.
+- **Factor-Aware Lockout (`AccountLockoutService`)**:
+  - Attempts are reserved *before* second-factor verification (`tryBeginAttempt`) so concurrent requests across nodes cannot exceed `maxFailures`.
+  - **1st-factor / unauthenticated `User` failures** (wrong password, malformed inline suffix, `OTP_ONLY`, direct `/v1/api/otp/validate`, unapproved out-of-band RADIUS, MFA pre-auth) lock only the `User` account (`RADIUS` / `MFA_PREAUTH` scopes) without DoS-locking a linked `Admin` sharing the same physical token.
+  - **Post-password 2nd-factor OTP failures** and **`Admin` failures** lock the `OtpToken` (`OTP_TOKEN` scope) as well as the account (`ADMIN` / `RADIUS` scopes), blocking shared-token access across both roles.
+- **Single-Use Token & User Replay Defense (`OtpVerificationService`)**:
+  - When an `OtpToken` is bound, TOTP time steps (`TOKEN:<id>`) and OCRA challenges are tracked against the token itself so an OTP consumed by a `User` cannot be replayed by an `Admin` (or vice versa) across web, REST, MFA pre-auth, or RADIUS.
+- **Immutable Audit Trail (`AuthAuditLog`)**:
+  - Marked `@Immutable` with `@PreUpdate`/`@PreRemove` guards rejecting modification or deletion; logs `WEB_LOGIN`, `ADMIN_LOGIN`, `MFA_PREAUTH`, `OTP_VALIDATION`, and `RADIUS` events across `SUCCESS`, `FAILURE`, `LOCKED`, `CHALLENGE`, `ENROLLMENT_REQUIRED`, and `ERROR` outcomes.
+- **Consistent REST API Errors (`GlobalExceptionHandler`)**:
+  - Maps `BadRequestException` (`400`), `SetupAlreadyCompletedException` (`403`), `ResourceNotFoundException` (`404`), `ConflictException` (`409`), and validation errors to RFC 7807 `ProblemDetail` payloads with an `"error"` property.
+- **Access Control & DTOs (`SecurityConfig`, `UserResponse`, `AdminResponse`)**:
+  - Endpoints outside public auth/setup/OTP-validation paths require authentication (HTTP `401` on `/v1/api/**`, redirect to `/login` for browser routes).
+  - API controllers bind `UserRequest` / `AdminRequest` DTOs (never JPA entities) and return `UserResponse` / `AdminResponse` excluding passwords and secrets; partial `PUT` updates preserve existing `enabled` status when omitted.
 
 ---
 
 ## Configuration Reference
 
-### RADIUS Properties
+Runtime policies, NAS clients, and LDAP directories live in the database. Application properties configure UDP transport, worker sizing, and optional Day-0 seeding when tables are empty.
+
+### RADIUS Transport Properties (`radius.*`)
 
 | Property | Default | Description |
 |---|---|---|
-| `radius.enabled` | `true` | Enables the RADIUS UDP authentication server |
-| `radius.port` | `1812` | UDP port (`0` selects an ephemeral port for testing) |
-| `radius.bind-address` | `0.0.0.0` | Network interface IP to bind |
-| `radius.shared-secret` | `secret` | Shared secret between NAS/NPS and RADIUS server |
-| `radius.allowed-clients` | *(empty = any)* | Comma-separated list of permitted NAS/NPS client IPs |
-| `radius.mfa.ttl-seconds` | `60` | Lifetime of an out-of-band MFA approval token |
-| `radius.challenge.ttl-seconds` | `60` | Lifetime of an in-band Access-Challenge `State` attribute |
-| `radius.challenge.max-pending` | `10000` | Maximum pending challenge sessions permitted in memory |
-| `radius.require-message-authenticator` | `false` | Discards Access-Requests lacking an RFC 3579 Message-Authenticator |
-| `radius.lockout-seconds` | `300` | User lockout duration after consecutive failures |
-| `radius.max-failures` | `5` | Maximum failed attempts allowed before temporary lockout |
+| `radius.enabled` | `true` | Enables the embedded RADIUS UDP server |
+| `radius.port` | `1812` | UDP port (`0` selects an ephemeral port) |
+| `radius.bind-address` | *(wildcard)* | Network interface IP to bind (blank binds `0.0.0.0`) |
+| `radius.worker-threads` | `8` | Worker thread pool size for packet handling |
+| `radius.worker-queue-capacity` | `1000` | Bounded queue capacity before packets are dropped |
+| `radius.duplicate-cache-seconds` | `30` | Retransmission cache TTL for identical UDP packets |
+| `radius.max-duplicate-cache-entries` | `100000` | Maximum cached duplicate request entries |
 
-### LDAP Directory Properties
+### Optional First-Boot Seeding (`iam.bootstrap.*`)
+Applied only when `iam.bootstrap.seed-defaults=true` (default) and the target table is empty:
+
+| Property | Default | Description |
+|---|---|---|
+| `iam.bootstrap.seed-defaults` | `true` | Enables initial DB seeding on empty tables |
+| `iam.bootstrap.admin.enabled` | `true` | Allows seeding initial `Admin` if credentials are set |
+| `iam.bootstrap.admin.username` | *(empty)* | Initial admin username (otherwise use `/setup`) |
+| `iam.bootstrap.admin.password` | *(empty)* | Initial admin password (BCrypt-hashed via `AdminService`) |
+| `iam.bootstrap.admin.display-name` | *(username)* | `Person.displayName` for seeded bootstrap admin |
+| `iam.bootstrap.radius.shared-secret` | *(empty)* | Seeds `default` (`0.0.0.0/0`) / `default-ipv6` (`::/0`) or listed clients if supplied |
+| `iam.bootstrap.radius.allowed-clients` | *(empty)* | Optional IPs, CIDRs, or hostnames seeded instead of catch-all entries |
+| `iam.bootstrap.policy.max-failures` | `5` | Overrides seeded `default` `SecurityPolicy.maxFailures` |
+| `iam.bootstrap.policy.lockout-seconds` | `300` | Overrides seeded `lockoutSeconds` and `failureWindowSeconds` |
+| `iam.bootstrap.policy.challenge-ttl-seconds` | `60` | Overrides seeded `challengeTtlSeconds` |
+| `iam.bootstrap.policy.mfa-approval-ttl-seconds` | `60` | Overrides seeded `mfaApprovalTtlSeconds` |
+
+### Optional First-Boot LDAP Seed (`ldap.*`)
+Seeded as the `default` `LdapDirectory` only when `ldap_directories` is empty and `ldap.enabled=true` or `ldap.url` is set:
 
 | Property | Default | Description |
 |---|---|---|
 | `ldap.enabled` | `false` | Enables inbound LDAP / Active Directory federation |
-| `ldap.url` | `ldap://localhost:389` | LDAP server connection URL (`ldap://` or `ldaps://`) |
-| `ldap.base-dn` | `dc=example,dc=org` | Base Distinguished Name for user search |
-| `ldap.user-search-filter` | `(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))` | Filter for locating user entries |
-| `ldap.bind-dn` | *(empty = anonymous)* | Manager DN used for user search bind |
-| `ldap.bind-password` | *(empty)* | Password for manager bind DN |
-| `ldap.auto-provision` | `true` | Automatically provisions local user record on first successful directory login |
-| `ldap.fallback-to-local` | `false` | Fall back to local DB credentials if user is absent from directory |
+| `ldap.url` | *(empty)* | LDAP connection URL (`ldap://` or `ldaps://`) |
+| `ldap.base-dn` | *(empty)* | Base Distinguished Name for directory searches |
+| `ldap.user-search-filter` | `(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))` | Search filter locating user entries |
+| `ldap.user-dn-pattern` | *(empty)* | Direct bind DN pattern (skips search bind when set) |
+| `ldap.bind-dn` | *(empty)* | Service account DN for directory search bind |
+| `ldap.bind-password` | *(empty)* | Service account password |
+| `ldap.realm` | *(empty)* | Comma-separated realm alias(es) routed to this directory |
+| `ldap.priority` | `100` | Evaluation priority (ascending) |
+| `ldap.auto-provision` | `true` | Enables JIT local account provisioning |
+| `ldap.fallback-to-local` | `false` | Falls back to local BCrypt password if user is absent |
 | `ldap.connect-timeout-ms` | `5000` | Socket connection timeout |
 | `ldap.read-timeout-ms` | `10000` | Socket read timeout |
-| `ldap.realm` | *(empty)* | Realm identifier(s), comma separated, routing qualified names to the seeded directory |
-| `ldap.priority` | `100` | Evaluation order of the seeded directory (lower first) |
-
-> The `radius.*` and `ldap.*` properties above are only used to **seed** the database on first start
-> (see below). Once the tables are populated, the persisted records are authoritative.
+| `ldap.referral` | `ignore` | JNDI referral handling policy |
+| `ldap.username-attributes` | `uid,sAMAccountName` | Ordered attributes for canonical username extraction |
 
 ---
 
-## Persistent Runtime Configuration & State (Clustering / Multi-Tenancy)
-
-All runtime configuration, session tracking, security policy and audit data is stored in the database through
-typed JPA entities, so several nodes can share one database and state survives restarts.
+## Persistent Entities & State
 
 | Entity | Table | Purpose |
 |---|---|---|
-| `RadiusClient` | `radius_clients` | NAS / NPS clients: name, IPv4/IPv6 address **or CIDR subnet**, dedicated shared secret, `active` flag. The most specific active match for the sender address supplies the secret used to validate the Message-Authenticator, decrypt `User-Password` and sign responses. Packets from unmatched addresses are dropped. |
-| `LdapDirectory` | `ldap_directories` | Federated directories: realm identifier(s), URL, base DN, search filter / DN pattern, bind credentials, timeouts, `priority`, `enabled`, `auto_provision`, `fallback_to_local`. `REALM\user` / `user@realm` is routed directly to the matching directory; unqualified names are evaluated across enabled directories in priority order (stopping at the first directory that knows the user; an unavailable directory fails closed). |
-| `SecurityPolicy` | `security_policies` | Policy `default`: RADIUS lockout threshold / duration / failure window, challenge TTL and max pending sessions, MFA approval TTL, MFA pre-auth lockout threshold / window, OTP reuse window. Read on every use, so changes apply cluster-wide immediately. |
-| `RadiusChallengeSession` | `radius_challenge_sessions` | Pending in-band `Access-Challenge` `State` sessions (single-use, atomically consumed). |
-| `MfaApproval` | `mfa_approvals` | Out-of-band MFA pre-authentication approvals (single-use, atomically consumed). |
-| `AuthFailureRecord` | `auth_failure_records` | Brute-force failure counters and lockouts (scopes `RADIUS` per user id, `MFA_PREAUTH` per user name). |
-| `AuthAuditLog` | `auth_audit_logs` | Append-only log of every authentication attempt (web login, MFA pre-auth, RADIUS): time, channel, user, client address / name, outcome and failure reason. |
-
-**Bootstrap.** When the application starts against an uninitialized database, each empty table is seeded from
-the legacy properties: the `default` security policy from `radius.max-failures`, `radius.lockout-seconds`,
-`radius.challenge.*` and `radius.mfa.ttl-seconds`; one RADIUS client per `radius.allowed-clients` entry (or the
-catch-all clients `0.0.0.0/0` and `::/0` when empty) with `radius.shared-secret`; and one LDAP directory named
-`default` from `ldap.*`. Tables that already contain data are never modified. Disable with
-`iam.bootstrap.seed-defaults=false`.
+| `Person` | `persons` | Natural identity owning `OtpToken`s and linked accounts (`enabled` master switch) |
+| `OtpToken` | `otp_tokens` | Single source of truth for hardware/app TOTP & OCRA secrets |
+| `User` | `users` | End-user login principal, local BCrypt password, `Person`/`OtpToken` links, optional `AuthMode` |
+| `Admin` | `admins` | Privileged admin principal linked to `Person` and `OtpToken` with strict 2FA |
+| `RadiusClient` | `radius_clients` | NAS/NPS clients: CIDR/IP match, shared secret, active flag, optional `AuthMode` |
+| `LdapDirectory` | `ldap_directories` | Federated LDAP configs with `userEnabled`/`adminEnabled` separation, realms, and priority |
+| `SecurityPolicy` | `security_policies` | Cluster-wide `default` policy (lockout, TTLs, `stripRealm`, `defaultAuthMode`, `mfaOutOfBandEnabled`) |
+| `RadiusChallengeSession` | `radius_challenge_sessions` | Single-use in-band `Access-Challenge` `State` sessions bound to user and client IP |
+| `MfaApproval` | `mfa_approvals` | Single-use out-of-band MFA pre-authentication approvals |
+| `AuthFailureRecord` | `auth_failure_records` | Optimistically locked brute-force counters (`RADIUS`, `MFA_PREAUTH`, `ADMIN`, `OTP_TOKEN`) |
+| `OtpReplayState` | `otp_replay_state` | Atomic monotonic TOTP time-step tracking per `TOKEN:<id>` or `USER:<id>` |
+| `OcraChallengeUse` | `ocra_challenge_uses` | Single-use hashed OCRA challenge replay tracking per `TOKEN:<id>` or `USER:<id>` |
+| `AuthAuditLog` | `auth_audit_logs` | Append-only (`@Immutable`) authentication audit log |
 
 ---
 
-## REST API Summary
+## REST & Web Endpoints Summary
 
 | Method | Endpoint | Access | Description |
 |---|---|---|---|
-| `POST` | `/v1/api/auth/login` | Public | Primary authentication with directory routing, JIT provisioning, and MFA verification |
-| `POST` | `/v1/api/mfa/preauth` | Public | Out-of-band MFA pre-authentication for RD Gateway |
-| `POST` | `/v1/api/otp/validate` | Public | Validates a standard 6-digit TOTP code |
-| `POST` | `/v1/api/otp/validate-ocra` | Public | Validates an OCRA challenge-response code |
-| `POST` | `/v1/api/otp/generate/{id}` | Authenticated | Generates a new TOTP secret for the specified user ID |
-| `GET` | `/v1/api/users/all` | Authenticated | Lists all registered user accounts (secrets & passwords excluded) |
-| `GET` | `/v1/api/users/{id}` | Authenticated | Retrieves user details by ID |
-| `POST` | `/v1/api/users/create` | Authenticated | Registers a new local user (passwords auto-hashed with BCrypt) |
-| `PUT` | `/v1/api/users/{id}` | Authenticated | Updates existing user account details |
-| `DELETE`| `/v1/api/users/{id}` | Authenticated | Deletes a user account |
+| `GET` / `POST` | `/setup`, `/setup/admin`, `/setup/ldap` | Public (Day-0 only) | First-run browser setup wizard (locks once complete) |
+| `GET` | `/v1/api/setup/status` | Public | Returns whether initial setup is still required |
+| `POST` | `/v1/api/setup/admin` | Public (Day-0 only) | Creates initial local `Admin` + `Person` (locks setup) |
+| `POST` | `/v1/api/setup/ldap` | Public (Day-0 only) | Registers initial Admin `LdapDirectory` (locks setup) |
+| `POST` | `/v1/api/auth/login` | Public | End-user REST authentication across configured `AuthMode`s |
+| `POST` | `/v1/api/admin/auth/login` | Public | Admin REST login (primary + strict 2FA / enrollment) |
+| `GET` / `POST` | `/login`, `/login/otp`, `/login/enroll` | Public | CSRF-protected 2-step browser admin login & TOTP enrollment |
+| `GET` / `POST` | `/mfa` | Public | Browser MFA pre-authentication page for RDG |
+| `POST` | `/v1/api/mfa/preauth` | Public | Out-of-band MFA pre-authentication API |
+| `POST` | `/v1/api/otp/validate` | Public | Validates 6-digit TOTP by `username` |
+| `POST` | `/v1/api/otp/validate-ocra` | Public | Validates OCRA challenge-response by `username` |
+| `POST` | `/v1/api/otp/generate` | Authenticated | Rotates/provisions TOTP secret by JSON `{"username": ...}` |
+| `POST` | `/v1/api/otp/generate/{username}` | Authenticated | Rotates/provisions TOTP secret for `username` |
+| `GET` / `POST` / `PUT` | `/v1/api/persons/**`, `/{id}/tokens`, `/tokens/{tokenId}/rotate` | Authenticated | Manages `Person` identities and `OtpToken` lifecycle/rotation |
+| `GET/POST/PUT/DELETE` | `/v1/api/users/all`, `/{id}`, `/create` | Authenticated | Manages end-user accounts (`UserRequest` / `UserResponse`) |
+| `GET/POST/PUT/DELETE` | `/v1/api/admins/all`, `/{id}`, `/create` | Authenticated | Manages admin accounts (`AdminRequest` / `AdminResponse`) |
+| `GET/POST/PUT/DELETE` | `/v1/api/radius-clients/all`, `/{id}`, `/create` | Authenticated | Manages allowed RADIUS clients and per-client secrets/modes |
+| `GET/POST/PUT/DELETE` | `/v1/api/ldap-directories/all`, `/{id}`, `/create` | Authenticated | Manages federated LDAP directories |
+| `GET` / `PUT` | `/v1/api/policies/current` | Authenticated | Reads or updates the cluster-wide `default` `SecurityPolicy` |
+| `GET` / `POST` | `/users/**`, `/logout` | Authenticated | Thymeleaf admin user management & OTP QR views |
 
 ---
 
 ## Building and Running
 
 ### Prerequisites
-- Java 17 or higher (Java 21 supported)
-- Maven 3.8+
+- **Java 21** (Eclipse Adoptium JDK 21 or compatible)
+- **Maven 3.9+**
 
 ### Build and Run Tests
 ```bash
@@ -182,4 +205,4 @@ mvn clean test
 ```bash
 mvn spring-boot:run
 ```
-Service runs on port `8081` (configurable via `server.port`). Web UI is accessible at `http://localhost:8081/`.
+Service listens on HTTP port `8081` (`server.port`) and UDP RADIUS port `1812` (`radius.port`). Open `http://localhost:8081/` to launch first-run `/setup` or `/login`.

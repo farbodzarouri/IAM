@@ -52,9 +52,9 @@ public class SecurityAuditRemediationTest {
     }
 
     @Test
-    @DisplayName("P0 Access Control: Anonymous caller to /v1/api/otp/generate/{id} is rejected with 401")
+    @DisplayName("P0 Access Control: Anonymous caller to /v1/api/otp/generate/{username} is rejected with 401")
     public void testOtpGenerate_Unauthenticated_ReturnsUnauthorized() throws Exception {
-        mockMvc.perform(post("/v1/api/otp/generate/1"))
+        mockMvc.perform(post("/v1/api/otp/generate/alice"))
                 .andExpect(status().isUnauthorized());
     }
 

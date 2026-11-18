@@ -11,10 +11,10 @@ import org.springframework.transaction.annotation.Transactional;
 @Repository
 public interface OcraChallengeUseRepository extends JpaRepository<OcraChallengeUse, Long> {
 
-    boolean existsByUserIdAndChallengeHash(Long userId, String challengeHash);
+    boolean existsBySubjectKeyAndChallengeHash(String subjectKey, String challengeHash);
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("delete from OcraChallengeUse u where u.userId = :userId")
-    int deleteByUserId(@Param("userId") Long userId);
+    @Query("delete from OcraChallengeUse u where u.subjectKey = :subjectKey")
+    int deleteBySubjectKey(@Param("subjectKey") String subjectKey);
 }

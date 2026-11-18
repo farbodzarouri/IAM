@@ -44,6 +44,16 @@ public class LdapDirectory {
     @Column(name = "enabled", nullable = false)
     private boolean enabled = true;
 
+    /** Whether end users ({@link User}) may authenticate against this directory. */
+    @Builder.Default
+    @Column(name = "user_enabled", nullable = false)
+    private boolean userEnabled = true;
+
+    /** Whether administrators ({@link Admin}) may authenticate against this directory. */
+    @Builder.Default
+    @Column(name = "admin_enabled", nullable = false)
+    private boolean adminEnabled = false;
+
     /** Lower values are evaluated first. */
     @Builder.Default
     @Column(name = "priority", nullable = false)

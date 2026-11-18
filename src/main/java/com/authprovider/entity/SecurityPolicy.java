@@ -76,27 +76,42 @@ public class SecurityPolicy {
     @Column(name = "otp_reuse_window_seconds", nullable = false)
     private long otpReuseWindowSeconds = 120;
 
+    /** RADIUS: require RFC 3579 Message-Authenticator on every Access-Request. */
+    @Builder.Default
+    @Column(name = "require_message_authenticator", nullable = false)
+    private boolean requireMessageAuthenticator = false;
+
+    /** Whether DOMAIN\\user and user@realm forms strip the realm when matching local accounts. */
+    @Builder.Default
+    @Column(name = "strip_realm", nullable = false)
+    private boolean stripRealm = true;
+
+    /** RADIUS Access-Challenge Reply-Message prompt. */
+    @Builder.Default
+    @Column(name = "challenge_prompt", nullable = false, length = 253)
+    private String challengePrompt = "Enter your one-time passcode";
+
+    /** Whether Out-of-Band RADIUS (Access-Request without User-Password via /mfa pre-auth) is enabled. */
+    @Builder.Default
+    @Column(name = "mfa_out_of_band_enabled", nullable = false)
+    private boolean mfaOutOfBandEnabled = true;
+
+    /** Default authentication mode when a RADIUS client or User does not specify an override. */
+    @Builder.Default
+    @Enumerated(EnumType.STRING)
+    @Column(name = "default_auth_mode", nullable = false, length = 32)
+    private AuthMode defaultAuthMode = AuthMode.PASSWORD_AND_OTP;
+
     @Column(name = "updated_at")
     private Instant updatedAt;
+
+    public AuthMode getDefaultAuthMode() {
+        return defaultAuthMode == null ? AuthMode.PASSWORD_AND_OTP : defaultAuthMode;
+    }
 
     @PrePersist
     @PreUpdate
     void touch() {
         updatedAt = Instant.now();
-    }
-
-    public void validate() {
-        if (maxFailures <= 0 || lockoutSeconds <= 0 || failureWindowSeconds <= 0) {
-            throw new IllegalStateException("Security policy '" + name + "': failure thresholds and windows must be positive");
-        }
-        if (challengeTtlSeconds <= 0 || challengeMaxPending <= 0) {
-            throw new IllegalStateException("Security policy '" + name + "': challenge settings must be positive");
-        }
-        if (mfaApprovalTtlSeconds <= 0 || mfaMaxFailedAttempts <= 0 || mfaLockoutWindowSeconds <= 0) {
-            throw new IllegalStateException("Security policy '" + name + "': MFA settings must be positive");
-        }
-        if (otpReuseWindowSeconds <= 0) {
-            throw new IllegalStateException("Security policy '" + name + "': OTP reuse window must be positive");
-        }
     }
 }

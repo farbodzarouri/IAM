@@ -1,12 +1,15 @@
 package com.authprovider.service;
 
+import com.authprovider.dto.OtpValidationResponse;
 import com.authprovider.entity.User;
+import com.authprovider.exception.ResourceNotFoundException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -45,12 +48,24 @@ public class UserOtpServiceTest {
     }
 
     @Test
-    public void testGenerateSecretForUser_NotFound() {
-        when(userService.getUserById(99L)).thenReturn(null);
+    public void testGenerateSecretForUsername_NotFoundThrows() {
+        when(userService.findAllByUsernameIgnoreCase("missing")).thenReturn(List.of());
 
-        Optional<String> secret = userOtpService.generateSecretForUser(99L);
+        assertThrows(ResourceNotFoundException.class, () -> userOtpService.generateSecretForUsername("missing"));
+    }
 
-        assertTrue(secret.isEmpty());
+    @Test
+    public void testValidateOtpByUsername_Success() {
+        User user = User.builder().id(1L).username("alice").secret("JBSWY3DPEHPK3PXP").build();
+        when(userService.findAllByUsernameIgnoreCase("CORP\\alice")).thenReturn(List.of());
+        when(userService.findAllByUsernameIgnoreCase("alice")).thenReturn(List.of(user));
+        when(totpService.validateOtp("JBSWY3DPEHPK3PXP", 123456)).thenReturn(true);
+
+        OtpValidationResponse response = userOtpService.validateOtpByUsername("CORP\\alice", "123456");
+
+        assertTrue(response.isValid());
+        assertEquals(OtpValidationResponse.Status.VALID, response.getStatus());
+        assertEquals("alice", response.getUsername());
     }
 
     @Test
@@ -63,6 +78,18 @@ public class UserOtpServiceTest {
 
         assertTrue(result.isPresent());
         assertTrue(result.get());
+    }
+
+    @Test
+    public void testValidateOcraByUsername_Success() {
+        User user = User.builder().id(1L).username("alice").secret("JBSWY3DPEHPK3PXP").build();
+        when(userService.findAllByUsernameIgnoreCase("alice")).thenReturn(List.of(user));
+        when(ocraService.validateOcra("JBSWY3DPEHPK3PXP", "challenge", "654321")).thenReturn(true);
+
+        OtpValidationResponse response = userOtpService.validateOcraByUsername("alice", "challenge", "654321");
+
+        assertTrue(response.isValid());
+        assertEquals(OtpValidationResponse.Status.VALID, response.getStatus());
     }
 
     @Test

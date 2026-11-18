@@ -28,7 +28,9 @@ public class AuthAuditLog {
     public enum Channel {
         WEB_LOGIN,
         MFA_PREAUTH,
-        RADIUS
+        RADIUS,
+        ADMIN_LOGIN,
+        OTP_VALIDATION
     }
 
     public enum Outcome {

@@ -2,7 +2,6 @@ package com.authprovider.service;
 
 import com.authprovider.entity.AuthFailureRecord;
 import com.authprovider.entity.SecurityPolicy;
-import com.authprovider.radius.RadiusProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -33,18 +32,20 @@ public class AccountLockoutService {
 
     /** Records are keyed by user id. The scope name is kept for compatibility with existing data. */
     public static final String SCOPE = AuthFailureRecord.SCOPE_ACCOUNT;
+    public static final String SCOPE_ADMIN = AuthFailureRecord.SCOPE_ADMIN;
+    public static final String SCOPE_OTP_TOKEN = AuthFailureRecord.SCOPE_OTP_TOKEN;
 
     private final SecurityPolicyService policyService;
     private final AuthFailureStore failureStore;
     private final Clock clock;
     private final PendingAuthSessionInvalidator sessionInvalidator;
     private final List<LongConsumer> resetListeners = new CopyOnWriteArrayList<>();
+    private final List<LongConsumer> tokenLockListeners = new CopyOnWriteArrayList<>();
 
     @Autowired
     public AccountLockoutService(SecurityPolicyService policyService, AuthFailureStore failureStore, Clock clock,
                                  PendingAuthSessionInvalidator sessionInvalidator) {
-        this.policyService = policyService == null ? SecurityPolicyService.fromProperties(new RadiusProperties())
-                : policyService;
+        this.policyService = policyService == null ? SecurityPolicyService.withDefaults() : policyService;
         this.failureStore = failureStore == null ? new InMemoryAuthFailureStore() : failureStore;
         this.clock = clock == null ? Clock.systemUTC() : clock;
         this.sessionInvalidator = sessionInvalidator == null ? new PendingAuthSessionInvalidator() : sessionInvalidator;
@@ -81,12 +82,15 @@ public class AccountLockoutService {
     }
 
     public boolean isLocked(Long userId) {
-        if (userId == null) {
-            return false;
-        }
-        Instant now = clock.instant();
-        SecurityPolicy policy = policyService.current();
-        return failureStore.get(SCOPE, key(userId)).map(state -> isLocked(state, now, policy)).orElse(false);
+        return userId != null && isLocked(SCOPE, key(userId));
+    }
+
+    public boolean isAdminLocked(Long adminId) {
+        return adminId != null && isLocked(SCOPE_ADMIN, key(adminId));
+    }
+
+    public boolean isTokenLocked(Long tokenId) {
+        return tokenId != null && isLocked(SCOPE_OTP_TOKEN, key(tokenId));
     }
 
     /**
@@ -95,41 +99,72 @@ public class AccountLockoutService {
      * reservation must be followed by {@link #confirmFailure} or {@link #recordSuccess}.
      */
     public boolean tryBeginAttempt(Long userId) {
-        if (userId == null) {
-            return true;
-        }
-        Instant now = clock.instant();
-        SecurityPolicy policy = policyService.current();
-        Duration window = Duration.ofSeconds(policy.getFailureWindowSeconds());
-        boolean[] reserved = {false};
-        failureStore.update(SCOPE, key(userId), current -> {
-            reserved[0] = false;
-            if (current != null && isLocked(current, now, policy)) {
-                return current;
-            }
-            reserved[0] = true;
-            if (isFresh(current, now, window)) {
-                return new AuthFailureStore.FailureState(1, now, now, null);
-            }
-            return new AuthFailureStore.FailureState(current.count() + 1,
-                    current.windowStart() == null ? now : current.windowStart(), now, null);
-        }, true);
-        return reserved[0];
+        return userId == null || tryBeginAttempt(SCOPE, key(userId));
+    }
+
+    public boolean tryBeginAdminAttempt(Long adminId) {
+        return adminId == null || tryBeginAttempt(SCOPE_ADMIN, key(adminId));
+    }
+
+    public boolean tryBeginTokenAttempt(Long tokenId) {
+        return tokenId == null || tryBeginAttempt(SCOPE_OTP_TOKEN, key(tokenId));
     }
 
     /** Confirms that a reserved attempt failed, locking the account when the threshold is reached. */
     public void confirmFailure(Long userId) {
-        applyFailure(userId, false);
+        if (userId != null) {
+            applyFailure(SCOPE, key(userId), false, () -> invalidateOnLock(userId));
+        }
     }
 
     /** Records a failed attempt that was not reserved beforehand (e.g. a wrong primary password). */
     public void recordFailure(Long userId) {
-        applyFailure(userId, true);
+        if (userId != null) {
+            applyFailure(SCOPE, key(userId), true, () -> invalidateOnLock(userId));
+        }
+    }
+
+    public void confirmAdminFailure(Long adminId, Long otpTokenId) {
+        if (adminId != null) {
+            applyFailure(SCOPE_ADMIN, key(adminId), false, () -> {
+                if (otpTokenId != null) {
+                    lockToken(otpTokenId);
+                }
+            });
+        }
+    }
+
+    public void recordAdminFailure(Long adminId, Long otpTokenId) {
+        if (adminId != null) {
+            applyFailure(SCOPE_ADMIN, key(adminId), true, () -> {
+                if (otpTokenId != null) {
+                    lockToken(otpTokenId);
+                }
+            });
+        }
+    }
+
+    public void confirmTokenFailure(Long tokenId) {
+        if (tokenId != null) {
+            applyFailure(SCOPE_OTP_TOKEN, key(tokenId), false, () -> notifyTokenLocked(tokenId));
+        }
+    }
+
+    public void recordTokenFailure(Long tokenId) {
+        if (tokenId != null) {
+            applyFailure(SCOPE_OTP_TOKEN, key(tokenId), true, () -> notifyTokenLocked(tokenId));
+        }
     }
 
     public void addResetListener(LongConsumer listener) {
         if (listener != null) {
             resetListeners.add(listener);
+        }
+    }
+
+    public void addTokenLockListener(LongConsumer listener) {
+        if (listener != null) {
+            tokenLockListeners.add(listener);
         }
     }
 
@@ -148,18 +183,84 @@ public class AccountLockoutService {
         }
     }
 
+    public void recordAdminSuccess(Long adminId) {
+        if (adminId != null) {
+            failureStore.delete(SCOPE_ADMIN, key(adminId));
+        }
+    }
+
+    public void recordTokenSuccess(Long tokenId) {
+        if (tokenId != null && !isTokenLocked(tokenId)) {
+            failureStore.delete(SCOPE_OTP_TOKEN, key(tokenId));
+        }
+    }
+
+    public void lockToken(Long tokenId) {
+        if (tokenId == null) {
+            return;
+        }
+        Instant until = clock.instant().plus(Duration.ofSeconds(policyService.current().getLockoutSeconds()));
+        if (lockScopeUntil(SCOPE_OTP_TOKEN, key(tokenId), until)) {
+            log.warn("OTP token id {} locked out until {}", tokenId, until);
+            notifyTokenLocked(tokenId);
+        }
+    }
+
     /** Enforces an account-wide lockout until at least {@code until} (e.g. triggered by MFA pre-auth). */
     public void lockUntil(Long userId, Instant until) {
         if (userId == null || until == null) {
             return;
         }
+        if (lockScopeUntil(SCOPE, key(userId), until)) {
+            log.warn("Account id {} locked out across all channels until {}", userId, until);
+            invalidateOnLock(userId);
+        }
+    }
+
+    public void purgeExpired() {
+        Instant now = clock.instant();
+        SecurityPolicy policy = policyService.current();
+        Duration window = Duration.ofSeconds(policy.getFailureWindowSeconds());
+        Instant cutoff = now.minus(window);
+        failureStore.purgeExpired(SCOPE, cutoff, now);
+        failureStore.purgeExpired(SCOPE_ADMIN, cutoff, now);
+        failureStore.purgeExpired(SCOPE_OTP_TOKEN, cutoff, now);
+    }
+
+    private boolean isLocked(String scope, String subjectKey) {
+        Instant now = clock.instant();
+        SecurityPolicy policy = policyService.current();
+        return failureStore.get(scope, subjectKey).map(state -> isLocked(state, now, policy)).orElse(false);
+    }
+
+    private boolean tryBeginAttempt(String scope, String subjectKey) {
+        Instant now = clock.instant();
+        SecurityPolicy policy = policyService.current();
+        Duration window = Duration.ofSeconds(policy.getFailureWindowSeconds());
+        boolean[] reserved = {false};
+        failureStore.update(scope, subjectKey, current -> {
+            reserved[0] = false;
+            if (current != null && isLocked(current, now, policy)) {
+                return current;
+            }
+            reserved[0] = true;
+            if (isFresh(current, now, window)) {
+                return new AuthFailureStore.FailureState(1, now, now, null);
+            }
+            return new AuthFailureStore.FailureState(current.count() + 1,
+                    current.windowStart() == null ? now : current.windowStart(), now, null);
+        }, true);
+        return reserved[0];
+    }
+
+    private boolean lockScopeUntil(String scope, String subjectKey, Instant until) {
         Instant now = clock.instant();
         if (!now.isBefore(until)) {
-            return;
+            return false;
         }
         SecurityPolicy policy = policyService.current();
         boolean[] newlyLocked = {false};
-        failureStore.update(SCOPE, key(userId), current -> {
+        failureStore.update(scope, subjectKey, current -> {
             boolean alreadyLocked = current != null && isLocked(current, now, policy);
             newlyLocked[0] = !alreadyLocked;
             int count = current == null ? policy.getMaxFailures() : Math.max(current.count(), 1);
@@ -170,34 +271,17 @@ public class AccountLockoutService {
                     : until;
             return new AuthFailureStore.FailureState(count, windowStart, now, effectiveUntil);
         }, true);
-        if (newlyLocked[0]) {
-            log.warn("Account id {} locked out across all channels until {}", userId, until);
-            try {
-                sessionInvalidator.invalidate(userId);
-            } catch (RuntimeException e) {
-                log.error("Failed to invalidate pending sessions of locked-out account id {}", userId, e);
-            }
-        }
+        return newlyLocked[0];
     }
 
-    public void purgeExpired() {
-        Instant now = clock.instant();
-        SecurityPolicy policy = policyService.current();
-        Duration window = Duration.ofSeconds(policy.getFailureWindowSeconds());
-        failureStore.purgeExpired(SCOPE, now.minus(window), now);
-    }
-
-    private void applyFailure(Long userId, boolean increment) {
-        if (userId == null) {
-            return;
-        }
+    private void applyFailure(String scope, String subjectKey, boolean increment, Runnable onNewlyLocked) {
         Instant now = clock.instant();
         SecurityPolicy policy = policyService.current();
         Duration window = Duration.ofSeconds(policy.getFailureWindowSeconds());
         Duration lockout = Duration.ofSeconds(policy.getLockoutSeconds());
         boolean[] newlyLocked = {false};
         int[] failures = {0};
-        failureStore.update(SCOPE, key(userId), current -> {
+        failureStore.update(scope, subjectKey, current -> {
             newlyLocked[0] = false;
             if (current != null && current.lockedUntil() != null && now.isBefore(current.lockedUntil())) {
                 // Already locked: keep the lockout as is.
@@ -222,12 +306,28 @@ public class AccountLockoutService {
             return new AuthFailureStore.FailureState(count, windowStart, now, lockedUntil);
         }, true);
         if (newlyLocked[0]) {
-            log.warn("Account id {} locked out for {}s after {} consecutive authentication failures",
-                    userId, lockout.getSeconds(), failures[0]);
+            log.warn("{} '{}' locked out for {}s after {} consecutive authentication failures",
+                    scope, subjectKey, lockout.getSeconds(), failures[0]);
+            if (onNewlyLocked != null) {
+                onNewlyLocked.run();
+            }
+        }
+    }
+
+    private void invalidateOnLock(Long userId) {
+        try {
+            sessionInvalidator.invalidate(userId);
+        } catch (RuntimeException e) {
+            log.error("Failed to invalidate pending sessions of locked-out account id {}", userId, e);
+        }
+    }
+
+    private void notifyTokenLocked(Long tokenId) {
+        for (LongConsumer listener : tokenLockListeners) {
             try {
-                sessionInvalidator.invalidate(userId);
+                listener.accept(tokenId);
             } catch (RuntimeException e) {
-                log.error("Failed to invalidate pending sessions of locked-out account id {}", userId, e);
+                log.error("Failed to notify token lock listener for token id {}", tokenId, e);
             }
         }
     }

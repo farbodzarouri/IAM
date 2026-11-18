@@ -1,6 +1,9 @@
 package com.authprovider.controller;
 
+import com.authprovider.dto.UserRequest;
 import com.authprovider.entity.User;
+import com.authprovider.exception.GlobalExceptionHandler;
+import com.authprovider.exception.ResourceNotFoundException;
 import com.authprovider.service.UserService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -15,6 +18,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -34,7 +38,9 @@ public class UserControllerTest {
 
     @BeforeEach
     public void setUp() {
-        mockMvc = MockMvcBuilders.standaloneSetup(userController).build();
+        mockMvc = MockMvcBuilders.standaloneSetup(userController)
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
     }
 
     @Test
@@ -50,7 +56,7 @@ public class UserControllerTest {
     @Test
     public void testGetUserById() throws Exception {
         User user = User.builder().id(1L).username("bob").build();
-        when(userService.getUserById(1L)).thenReturn(user);
+        when(userService.getUserOrThrow(1L)).thenReturn(user);
 
         mockMvc.perform(get("/v1/api/users/1"))
                 .andExpect(status().isOk())
@@ -58,9 +64,18 @@ public class UserControllerTest {
     }
 
     @Test
+    public void testGetUserById_NotFound() throws Exception {
+        when(userService.getUserOrThrow(999L)).thenThrow(new ResourceNotFoundException("User not found: 999"));
+
+        mockMvc.perform(get("/v1/api/users/999"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error").value("User not found: 999"));
+    }
+
+    @Test
     public void testCreateUser() throws Exception {
         User user = User.builder().id(1L).username("charlie").password("pass").build();
-        when(userService.saveUser(any(User.class))).thenReturn(user);
+        when(userService.createUser(any(UserRequest.class))).thenReturn(user);
 
         mockMvc.perform(post("/v1/api/users/create")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -72,7 +87,7 @@ public class UserControllerTest {
     @Test
     public void testUpdateUser() throws Exception {
         User user = User.builder().id(1L).username("updated").build();
-        when(userService.saveUser(any(User.class))).thenReturn(user);
+        when(userService.updateUser(eq(1L), any(UserRequest.class))).thenReturn(user);
 
         mockMvc.perform(put("/v1/api/users/1")
                         .contentType(MediaType.APPLICATION_JSON)

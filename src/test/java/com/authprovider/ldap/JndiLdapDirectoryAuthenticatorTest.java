@@ -40,6 +40,8 @@ public class JndiLdapDirectoryAuthenticatorTest {
     void setUp() {
         properties = new LdapProperties();
         properties.setEnabled(true);
+        properties.setUrl("ldap://localhost:389");
+        properties.setBaseDn("dc=example,dc=org");
         managerContext = mock(DirContext.class);
         userContext = mock(DirContext.class);
     }

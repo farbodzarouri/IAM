@@ -7,23 +7,19 @@ import com.authprovider.ldap.DirectoryAuthenticator;
 import com.authprovider.ldap.DirectoryConfiguration;
 import com.authprovider.ldap.LdapPropertiesDirectoryConfiguration;
 import com.authprovider.repository.UserRepository;
+import com.authprovider.service.AccountLockoutService;
 import com.authprovider.service.AccountResolver;
+import com.authprovider.service.PasswordService;
+import com.authprovider.service.SecurityPolicyService;
 import com.authprovider.service.UsernameNormalizer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.IncorrectResultSizeDataAccessException;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Predicate;
 
 @Slf4j
@@ -32,13 +28,15 @@ public class PrimaryCredentialVerifier {
 
     static final String SOURCE_LOCAL = "LOCAL";
     static final String SOURCE_DIRECTORY = "LDAP";
-    private static final byte[] DUMMY_PASSWORD_DIGEST = sha256("\u0000radius-dummy-password\u0000".getBytes(StandardCharsets.UTF_8));
 
     private final UserRepository userRepository;
-    private final RadiusProperties properties;
     private final DirectoryConfiguration directoryConfiguration;
     private final DirectoryAuthenticator directoryAuthenticator;
-    private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+    private final AccountLockoutService lockoutService;
+    private final SecurityPolicyService policyService;
+    private final PasswordService passwordService;
+    private final AccountResolver<User> accountResolver;
+    private final Object provisioningLock = new Object();
 
     public enum Outcome {
         AUTHENTICATED,
@@ -59,25 +57,37 @@ public class PrimaryCredentialVerifier {
         }
     }
 
-    public PrimaryCredentialVerifier(UserRepository userRepository, RadiusProperties properties) {
-        this(userRepository, properties, (DirectoryConfiguration) null, null);
+    public PrimaryCredentialVerifier(UserRepository userRepository) {
+        this(userRepository, (DirectoryConfiguration) null, null, null, null, null);
     }
 
-    public PrimaryCredentialVerifier(UserRepository userRepository, RadiusProperties properties,
-                                     LdapProperties ldapProperties, DirectoryAuthenticator directoryAuthenticator) {
-        this(userRepository, properties,
+    public PrimaryCredentialVerifier(UserRepository userRepository,
+                                     LdapProperties ldapProperties,
+                                     DirectoryAuthenticator directoryAuthenticator) {
+        this(userRepository,
                 ldapProperties == null ? null : new LdapPropertiesDirectoryConfiguration(ldapProperties),
-                directoryAuthenticator);
+                directoryAuthenticator,
+                null,
+                null,
+                null);
     }
 
     @Autowired
-    public PrimaryCredentialVerifier(UserRepository userRepository, RadiusProperties properties,
+    public PrimaryCredentialVerifier(UserRepository userRepository,
                                      DirectoryConfiguration directoryConfiguration,
-                                     DirectoryAuthenticator directoryAuthenticator) {
+                                     DirectoryAuthenticator directoryAuthenticator,
+                                     AccountLockoutService lockoutService,
+                                     SecurityPolicyService policyService,
+                                     PasswordService passwordService) {
         this.userRepository = userRepository;
-        this.properties = properties;
         this.directoryConfiguration = directoryConfiguration;
         this.directoryAuthenticator = directoryAuthenticator;
+        this.lockoutService = lockoutService;
+        this.policyService = policyService != null ? policyService : SecurityPolicyService.withDefaults();
+        this.passwordService = passwordService != null ? passwordService : PasswordService.withDefaults();
+        this.accountResolver = new AccountResolver<>(
+                userRepository == null ? null : userRepository::findAllByUsernameIgnoreCase,
+                this::findExact);
     }
 
     public boolean isDirectoryEnabled() {
@@ -85,24 +95,40 @@ public class PrimaryCredentialVerifier {
     }
 
     /**
-     * Verifies the primary credentials of a RADIUS user. When LDAP is enabled the password is verified
-     * against the directory and the directory identity is linked to an already enrolled local account
-     * (no just-in-time provisioning over RADIUS); local passwords are only consulted for accounts unknown
-     * to the directory and only if the responsible directories permit fallback to local accounts. Otherwise the local user store is used.
+     * Verifies primary credentials expecting a second-factor OTP secret to be enrolled on the
+     * resolved account.
      */
     public Verification verify(String userName, byte[] password, Predicate<Long> isLocked) {
+        return verify(userName, password, isLocked, true);
+    }
+
+    /**
+     * Verifies the primary credentials of a RADIUS user. When {@code requireEnrollment} is {@code false}
+     * (password-only authentication), accounts without an enrolled OTP secret are permitted and LDAP-only
+     * accounts can be auto-provisioned when configured.
+     */
+    public Verification verify(String userName, byte[] password, Predicate<Long> isLocked, boolean requireEnrollment) {
         Optional<User> localUser = findUser(userName);
-        if (localUser.isPresent() && isLocked.test(localUser.get().getId())) {
+        if (localUser.isPresent() && isBlocked(localUser.get(), isLocked)) {
             simulatePasswordCheck(password);
             return new Verification(Outcome.LOCKED, localUser.get(), sourceLabel());
         }
         if (isDirectoryEnabled()) {
-            return verifyWithDirectory(userName, password, localUser, isLocked);
+            return verifyWithDirectory(userName, password, localUser, isLocked, requireEnrollment);
         }
-        return verifyLocal(localUser, password, SOURCE_LOCAL);
+        return verifyLocal(localUser, password, SOURCE_LOCAL, requireEnrollment);
     }
 
-    private Verification verifyLocal(Optional<User> localUser, byte[] password, String source) {
+    private boolean isBlocked(User user, Predicate<Long> isLocked) {
+        if (!user.isAccountEnabled() || isLocked.test(user.getId())) {
+            return true;
+        }
+        return lockoutService != null && user.getOtpToken() != null
+                && lockoutService.isTokenLocked(user.getOtpToken().getId());
+    }
+
+    private Verification verifyLocal(Optional<User> localUser, byte[] password, String source,
+                                     boolean requireEnrollment) {
         if (localUser.isEmpty()) {
             simulatePasswordCheck(password);
             return new Verification(Outcome.UNKNOWN_USER, null, source);
@@ -111,14 +137,14 @@ public class PrimaryCredentialVerifier {
         if (!passwordMatches(user, password)) {
             return new Verification(Outcome.INVALID_CREDENTIALS, user, source);
         }
-        if (!isEnrolled(user)) {
+        if (requireEnrollment && !isEnrolled(user)) {
             return new Verification(Outcome.NOT_ENROLLED, user, source);
         }
         return new Verification(Outcome.AUTHENTICATED, user, source);
     }
 
     private Verification verifyWithDirectory(String userName, byte[] password, Optional<User> localUser,
-                                             Predicate<Long> isLocked) {
+                                             Predicate<Long> isLocked, boolean requireEnrollment) {
         if (password == null || password.length == 0) {
             return new Verification(Outcome.INVALID_CREDENTIALS, localUser.orElse(null), SOURCE_DIRECTORY);
         }
@@ -143,22 +169,27 @@ public class PrimaryCredentialVerifier {
                         ? result.username() : loginName;
                 Optional<User> linked = findLinkedAccount(canonical);
                 if (linked.isEmpty()) {
-                    log.warn("Directory user '{}' has no enrolled local account; complete two-factor enrollment "
-                            + "before using RADIUS", RadiusAuthenticationHandler.sanitize(canonical));
-                    return new Verification(Outcome.NOT_ENROLLED, null, SOURCE_DIRECTORY);
+                    if (!requireEnrollment && directoryConfiguration.isAutoProvision(result)) {
+                        linked = provisionPasswordOnlyDirectoryUser(canonical);
+                    }
+                    if (linked.isEmpty()) {
+                        log.warn("Directory user '{}' has no enrolled local account; complete two-factor enrollment "
+                                + "before using RADIUS", RadiusAuthenticationHandler.sanitize(canonical));
+                        return new Verification(Outcome.NOT_ENROLLED, null, SOURCE_DIRECTORY);
+                    }
                 }
                 User user = linked.get();
-                if (isLocked.test(user.getId())) {
+                if (isBlocked(user, isLocked)) {
                     return new Verification(Outcome.LOCKED, user, SOURCE_DIRECTORY);
                 }
-                if (!isEnrolled(user)) {
+                if (requireEnrollment && !isEnrolled(user)) {
                     return new Verification(Outcome.NOT_ENROLLED, user, SOURCE_DIRECTORY);
                 }
                 return new Verification(Outcome.AUTHENTICATED, user, SOURCE_DIRECTORY);
             }
             case USER_NOT_FOUND:
                 if (directoryConfiguration.isFallbackToLocal(userName)) {
-                    return verifyLocal(localUser, password, SOURCE_LOCAL);
+                    return verifyLocal(localUser, password, SOURCE_LOCAL, requireEnrollment);
                 }
                 return new Verification(Outcome.UNKNOWN_USER, null, SOURCE_DIRECTORY);
             case UNAVAILABLE:
@@ -169,21 +200,42 @@ public class PrimaryCredentialVerifier {
         }
     }
 
+    private Optional<User> provisionPasswordOnlyDirectoryUser(String canonical) {
+        synchronized (provisioningLock) {
+            Optional<User> existing = findLinkedAccount(canonical);
+            if (existing.isPresent()) {
+                return existing;
+            }
+            try {
+                return Optional.of(userRepository.save(User.builder()
+                        .username(canonical)
+                        .enabled(true)
+                        .build()));
+            } catch (DataIntegrityViolationException e) {
+                return findLinkedAccount(canonical);
+            }
+        }
+    }
+
     String directoryLoginName(String userName) {
         String name = userName.trim();
-        if (properties.isStripRealm()) {
+        if (isStripRealm()) {
             String stripped = UsernameNormalizer.stripRealm(name);
             name = stripped == null ? "" : stripped;
         }
         return name.isEmpty() ? userName.trim() : name;
     }
 
+    private boolean isStripRealm() {
+        return policyService.current().isStripRealm();
+    }
+
     private String sourceLabel() {
         return isDirectoryEnabled() ? SOURCE_DIRECTORY : SOURCE_LOCAL;
     }
 
-    private static boolean isEnrolled(User user) {
-        return user.getSecret() != null && !user.getSecret().isBlank();
+    static boolean isEnrolled(User user) {
+        return user != null && user.getSecret() != null && !user.getSecret().isBlank();
     }
 
     /**
@@ -194,8 +246,7 @@ public class PrimaryCredentialVerifier {
         if (userName == null || userName.isEmpty()) {
             return Optional.empty();
         }
-        AccountResolver resolver = new AccountResolver(userRepository::findAllByUsernameIgnoreCase, this::findExact);
-        return resolver.resolve(userName, properties.isStripRealm()).asOptional();
+        return accountResolver.resolve(userName, isStripRealm()).asOptional();
     }
 
     /**
@@ -206,11 +257,13 @@ public class PrimaryCredentialVerifier {
         if (canonicalName == null || canonicalName.isBlank()) {
             return Optional.empty();
         }
-        AccountResolver resolver = new AccountResolver(userRepository::findAllByUsernameIgnoreCase, this::findExact);
-        return resolver.resolve(canonicalName, false).asOptional();
+        return accountResolver.resolve(canonicalName, false).asOptional();
     }
 
     private Optional<User> findExact(String candidate) {
+        if (userRepository == null) {
+            return Optional.empty();
+        }
         try {
             return userRepository.findByUsername(candidate);
         } catch (IncorrectResultSizeDataAccessException e) {
@@ -226,43 +279,11 @@ public class PrimaryCredentialVerifier {
             simulatePasswordCheck(suppliedPassword);
             return false;
         }
-        String stored = user.getPassword();
-        String raw = new String(suppliedPassword, StandardCharsets.UTF_8);
-        if (stored.startsWith("$2a$") || stored.startsWith("$2b$") || stored.startsWith("$2y$")) {
-            return passwordEncoder.matches(raw, stored);
-        }
-        byte[] supplied = sha256(suppliedPassword);
-        byte[] expected = sha256(stored.getBytes(StandardCharsets.UTF_8));
-        boolean matches = MessageDigest.isEqual(expected, supplied);
-        return matches;
+        return passwordService.matches(user.getPassword(), new String(suppliedPassword, StandardCharsets.UTF_8));
     }
 
     public void simulatePasswordCheck(byte[] suppliedPassword) {
-        MessageDigest.isEqual(DUMMY_PASSWORD_DIGEST, sha256(suppliedPassword));
-    }
-
-    List<String> candidateUserNames(String userName) {
-        if (userName == null || userName.isEmpty()) {
-            return List.of();
-        }
-        Set<String> candidates = new LinkedHashSet<>();
-        candidates.add(userName);
-        if (properties.isStripRealm()) {
-            String stripped = UsernameNormalizer.stripRealm(userName);
-            if (stripped != null && !stripped.isEmpty()) {
-                candidates.add(stripped);
-                candidates.add(stripped.toLowerCase(Locale.ROOT));
-            }
-        }
-        candidates.add(userName.toLowerCase(Locale.ROOT));
-        return new ArrayList<>(candidates);
-    }
-
-    private static byte[] sha256(byte[] data) {
-        try {
-            return MessageDigest.getInstance("SHA-256").digest(data);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 unavailable", e);
-        }
+        String candidate = suppliedPassword == null ? "" : new String(suppliedPassword, StandardCharsets.UTF_8);
+        passwordService.simulateCheck(candidate);
     }
 }

@@ -2,6 +2,9 @@ package com.authprovider.ldap;
 
 import com.authprovider.config.LdapProperties;
 import com.authprovider.entity.LdapDirectory;
+import com.authprovider.exception.BadRequestException;
+import com.authprovider.exception.ConflictException;
+import com.authprovider.exception.ResourceNotFoundException;
 import com.authprovider.repository.LdapDirectoryRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -10,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -48,11 +52,109 @@ public class LdapDirectoryService implements DirectoryConfiguration {
     }
 
     public List<LdapDirectory> enabledDirectories() {
-        return repository.findByEnabledTrueOrderByPriorityAscIdAsc();
+        return repository.findByEnabledTrueOrderByPriorityAscIdAsc().stream()
+                .filter(LdapDirectory::isUserEnabled)
+                .toList();
+    }
+
+    public List<LdapDirectory> enabledAdminDirectories() {
+        return repository.findByEnabledTrueOrderByPriorityAscIdAsc().stream()
+                .filter(LdapDirectory::isAdminEnabled)
+                .toList();
     }
 
     public Optional<LdapDirectory> findByName(String name) {
         return name == null ? Optional.empty() : repository.findByName(name);
+    }
+
+    public List<LdapDirectory> getAllDirectories() {
+        return repository.findAllByOrderByPriorityAscIdAsc();
+    }
+
+    public LdapDirectory getDirectoryOrThrow(Long id) {
+        if (id == null) {
+            throw new ResourceNotFoundException("LDAP directory not found: null");
+        }
+        return repository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("LDAP directory not found: " + id));
+    }
+
+    public LdapDirectory createDirectory(LdapDirectory directory) {
+        if (directory == null) {
+            throw new BadRequestException("LDAP directory payload is required");
+        }
+        directory.setId(null);
+        String name = normalizeDirectoryName(directory.getName());
+        directory.setName(name);
+        if (directory.getUrl() == null) {
+            directory.setUrl("");
+        } else {
+            directory.setUrl(directory.getUrl().trim());
+        }
+        if (repository.findByName(name).isPresent()) {
+            throw new ConflictException("LDAP directory already exists: " + name);
+        }
+        validateDirectoryIfEnabled(directory);
+        return repository.saveAndFlush(directory);
+    }
+
+    public LdapDirectory updateDirectory(Long id, LdapDirectory updated) {
+        LdapDirectory existing = getDirectoryOrThrow(id);
+        if (updated == null) {
+            throw new BadRequestException("LDAP directory payload is required");
+        }
+        String name = normalizeDirectoryName(updated.getName());
+        repository.findByName(name).ifPresent(other -> {
+            if (!Objects.equals(other.getId(), id)) {
+                throw new ConflictException("LDAP directory already exists: " + name);
+            }
+        });
+        existing.setName(name);
+        existing.setRealm(updated.getRealm());
+        existing.setEnabled(updated.isEnabled());
+        existing.setUserEnabled(updated.isUserEnabled());
+        existing.setAdminEnabled(updated.isAdminEnabled());
+        existing.setPriority(updated.getPriority());
+        existing.setUrl(updated.getUrl() == null ? "" : updated.getUrl().trim());
+        existing.setBaseDn(updated.getBaseDn());
+        existing.setUserSearchFilter(updated.getUserSearchFilter());
+        existing.setUserDnPattern(updated.getUserDnPattern());
+        existing.setBindDn(updated.getBindDn());
+        if (updated.getBindPassword() != null && !updated.getBindPassword().isBlank()) {
+            existing.setBindPassword(updated.getBindPassword());
+        }
+        existing.setAutoProvision(updated.isAutoProvision());
+        existing.setFallbackToLocal(updated.isFallbackToLocal());
+        existing.setConnectTimeoutMs(updated.getConnectTimeoutMs());
+        existing.setReadTimeoutMs(updated.getReadTimeoutMs());
+        existing.setReferral(updated.getReferral());
+        existing.setUsernameAttributes(updated.getUsernameAttributes());
+        validateDirectoryIfEnabled(existing);
+        return repository.saveAndFlush(existing);
+    }
+
+    public void deleteDirectory(Long id) {
+        LdapDirectory existing = getDirectoryOrThrow(id);
+        repository.delete(existing);
+    }
+
+    public static void validateDirectoryIfEnabled(LdapDirectory directory) {
+        if (!directory.isEnabled()) {
+            return;
+        }
+        try {
+            new JndiLdapDirectoryAuthenticator(toProperties(directory)).validateConfiguration();
+        } catch (IllegalStateException e) {
+            throw new BadRequestException(e.getMessage());
+        }
+    }
+
+    private static String normalizeDirectoryName(String raw) {
+        String name = raw == null ? "" : raw.trim();
+        if (name.isEmpty()) {
+            throw new BadRequestException("LDAP directory name is required");
+        }
+        return name;
     }
 
     @Override
@@ -61,31 +163,60 @@ public class LdapDirectoryService implements DirectoryConfiguration {
     }
 
     @Override
+    public boolean isAdminEnabled() {
+        return !enabledAdminDirectories().isEmpty();
+    }
+
+    @Override
     public boolean isFallbackToLocal(String username) {
-        Route route = route(username, username);
-        return !route.directories().isEmpty()
-                && route.directories().stream().allMatch(LdapDirectory::isFallbackToLocal);
+        return isFallbackToLocal(route(username, username));
+    }
+
+    @Override
+    public boolean isAdminFallbackToLocal(String username) {
+        return isFallbackToLocal(routeAdmin(username, username));
     }
 
     @Override
     public boolean isAutoProvision(DirectoryAuthenticationResult result) {
+        return isAutoProvision(enabledDirectories(), result);
+    }
+
+    @Override
+    public boolean isAdminAutoProvision(DirectoryAuthenticationResult result) {
+        return isAutoProvision(enabledAdminDirectories(), result);
+    }
+
+    /**
+     * Routes {@code qualifiedName}. If its realm matches enabled user directories they are returned
+     * with the realm stripped from the login name; otherwise all enabled user directories are returned
+     * together with {@code unqualifiedName}.
+     */
+    public Route route(String qualifiedName, String unqualifiedName) {
+        return route(enabledDirectories(), qualifiedName, unqualifiedName);
+    }
+
+    /** Routes {@code qualifiedName} across directories enabled for {@code Admin} authentication. */
+    public Route routeAdmin(String qualifiedName, String unqualifiedName) {
+        return route(enabledAdminDirectories(), qualifiedName, unqualifiedName);
+    }
+
+    private static boolean isFallbackToLocal(Route route) {
+        return !route.directories().isEmpty()
+                && route.directories().stream().allMatch(LdapDirectory::isFallbackToLocal);
+    }
+
+    private boolean isAutoProvision(List<LdapDirectory> enabled, DirectoryAuthenticationResult result) {
         if (result != null && result.directory() != null) {
             Optional<LdapDirectory> directory = findByName(result.directory());
             if (directory.isPresent()) {
                 return directory.get().isAutoProvision();
             }
         }
-        List<LdapDirectory> enabled = enabledDirectories();
         return !enabled.isEmpty() && enabled.get(0).isAutoProvision();
     }
 
-    /**
-     * Routes {@code qualifiedName}. If its realm matches enabled directories they are returned with the
-     * realm stripped from the login name; otherwise all enabled directories are returned together with
-     * {@code unqualifiedName}.
-     */
-    public Route route(String qualifiedName, String unqualifiedName) {
-        List<LdapDirectory> enabled = enabledDirectories();
+    private static Route route(List<LdapDirectory> enabled, String qualifiedName, String unqualifiedName) {
         QualifiedName parsed = parse(qualifiedName);
         if (parsed.isQualified()) {
             List<LdapDirectory> matching = new ArrayList<>();

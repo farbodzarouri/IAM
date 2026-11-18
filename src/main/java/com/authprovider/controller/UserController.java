@@ -1,6 +1,7 @@
 package com.authprovider.controller;
 
-import com.authprovider.entity.User;
+import com.authprovider.dto.UserRequest;
+import com.authprovider.dto.UserResponse;
 import com.authprovider.service.UserService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
@@ -12,28 +13,28 @@ import java.util.List;
 @RequestMapping("/v1/api/users")
 public class UserController {
 
-
     private final UserService userService;
 
     @GetMapping("/all")
-    public List<User> getAllUsers() {
-        return userService.getAllUsers();
+    public List<UserResponse> getAllUsers() {
+        return userService.getAllUsers().stream()
+                .map(UserResponse::from)
+                .toList();
     }
 
     @GetMapping("/{id}")
-    public User getUserById(@PathVariable Long id) {
-        return userService.getUserById(id);
+    public UserResponse getUserById(@PathVariable Long id) {
+        return UserResponse.from(userService.getUserOrThrow(id));
     }
 
     @PostMapping("/create")
-    public User createUser(@RequestBody User user) {
-        return userService.saveUser(user);
+    public UserResponse createUser(@RequestBody UserRequest request) {
+        return UserResponse.from(userService.createUser(request));
     }
 
     @PutMapping("/{id}")
-    public User updateUser(@PathVariable Long id, @RequestBody User user) {
-        user.setId(id);
-        return userService.saveUser(user);
+    public UserResponse updateUser(@PathVariable Long id, @RequestBody UserRequest request) {
+        return UserResponse.from(userService.updateUser(id, request));
     }
 
     @DeleteMapping("/{id}")

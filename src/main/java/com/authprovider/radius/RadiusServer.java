@@ -1,5 +1,6 @@
 package com.authprovider.radius;
 
+import com.authprovider.config.RadiusProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.SmartLifecycle;
@@ -120,8 +121,8 @@ public class RadiusServer implements SmartLifecycle {
         running = true;
         receiver = daemon(this::receiveLoop, "radius-receiver");
         receiver.start();
-        log.info("RADIUS server listening on {}:{} (challenge TTL {}s)",
-                socket.getLocalAddress().getHostAddress(), socket.getLocalPort(), properties.getChallenge().getTtlSeconds());
+        log.info("RADIUS server listening on {}:{}",
+                socket.getLocalAddress().getHostAddress(), socket.getLocalPort());
     }
 
     @Override

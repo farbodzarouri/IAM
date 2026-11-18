@@ -4,12 +4,14 @@ import org.apache.commons.codec.binary.Base32;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.security.SecureRandom;
 import java.time.Clock;
 
 @Configuration
-@EnableConfigurationProperties(LdapProperties.class)
+@EnableConfigurationProperties({RadiusProperties.class, LdapProperties.class, BootstrapProperties.class})
 public class AppConfig {
 
     @Bean
@@ -25,5 +27,10 @@ public class AppConfig {
     @Bean
     public Base32 base32() {
         return new Base32();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
     }
 }

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Initial IAM Setup</title>
+</head>
+<body>
+<h1>Initial IAM Setup</h1>
+<p>No local administrators or Admin LDAP directories are configured yet. Choose one bootstrap option below:</p>
+
+<h2>Option 1: Configure Admin LDAP Directory (JIT)</h2>
+<p th:if="${ldapError}" th:text="${ldapError}" style="color:red"></p>
+<form th:action="@{/setup/ldap}" method="post" autocomplete="off">
+    <div>
+        <label>Directory Name:</label>
+        <input type="text" name="name" value="admin-ldap" required/>
+    </div>
+    <div>
+        <label>LDAP URL:</label>
+        <input type="text" name="url" placeholder="ldaps://ldap.company.internal:636" required/>
+    </div>
+    <div>
+        <label>Base DN:</label>
+        <input type="text" name="baseDn" placeholder="dc=company,dc=internal" required/>
+    </div>
+    <div>
+        <label>User Search Filter:</label>
+        <input type="text" name="userSearchFilter" value="(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))" required/>
+    </div>
+    <div>
+        <label>Bind DN (optional):</label>
+        <input type="text" name="bindDn"/>
+    </div>
+    <div>
+        <label>Bind Password (optional):</label>
+        <input type="password" name="bindPassword"/>
+    </div>
+    <div>
+        <label><input type="checkbox" name="userEnabled" value="true"/> Also allow regular Users on this directory</label>
+    </div>
+    <div>
+        <input type="submit" value="Save Admin LDAP &amp; Continue"/>
+    </div>
+</form>
+
+<hr/>
+
+<h2>Option 2: Create First Local Administrator</h2>
+<p th:if="${adminError}" th:text="${adminError}" style="color:red"></p>
+<form th:action="@{/setup/admin}" method="post" autocomplete="off">
+    <div>
+        <label>Admin Username:</label>
+        <input type="text" name="username" required/>
+    </div>
+    <div>
+        <label>Display Name (optional):</label>
+        <input type="text" name="displayName"/>
+    </div>
+    <div>
+        <label>Password:</label>
+        <input type="password" name="password" required/>
+    </div>
+    <div>
+        <input type="submit" value="Create Local Admin"/>
+    </div>
+</form>
+</body>
+</html>

@@ -38,8 +38,8 @@ public class RadiusChallengeStore {
     private final Clock clock;
     private final SecureRandom secureRandom;
 
-    public RadiusChallengeStore(RadiusProperties properties, Clock clock, SecureRandom secureRandom) {
-        this(SecurityPolicyService.fromProperties(properties), null, clock, secureRandom);
+    public RadiusChallengeStore(SecurityPolicyService policyService, Clock clock, SecureRandom secureRandom) {
+        this(policyService, null, clock, secureRandom);
     }
 
     @Autowired

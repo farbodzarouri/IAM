@@ -10,6 +10,6 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 @AllArgsConstructor
 public class OtpValidationRequest {
-    private Long userId;
-    private Integer otp;
+    private String username;
+    private String otp;
 }

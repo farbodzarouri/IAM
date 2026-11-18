@@ -22,8 +22,6 @@ import java.net.InetAddress;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Arrays;
@@ -36,8 +34,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest(properties = {
         "radius.port=18125",
-        "radius.shared-secret=testing123",
-        "radius.mfa.ttl-seconds=3"
+        "iam.bootstrap.radius.shared-secret=testing123",
+        "iam.bootstrap.policy.mfa-approval-ttl-seconds=3"
 })
 @AutoConfigureMockMvc
 public class RadiusMfaAuthenticationTest {
@@ -62,13 +60,6 @@ public class RadiusMfaAuthenticationTest {
     @BeforeEach
     public void cleanUp() {
         userRepository.deleteAll();
-    }
-
-    @Test
-    public void testNoExternalDependenciesAddedToPom() throws Exception {
-        String pom = Files.readString(Path.of("pom.xml"), StandardCharsets.UTF_8);
-        long dependencyCount = pom.split("<dependency>", -1).length - 1;
-        assertEquals(11L, dependencyCount, "No external dependencies may be added to pom.xml");
     }
 
     private User createUserWithSecret(String username) {

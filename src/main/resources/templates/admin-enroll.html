@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Admin Authenticator Enrollment</title>
+</head>
+<body>
+<h1>Set Up Two-Factor Authentication</h1>
+<p>Scan this QR code with your authenticator app for <strong th:text="${username}">admin</strong>, then enter the first 6-digit code below to activate your account.</p>
+<p th:if="${error != null}" th:text="${error}" style="color:red">Error</p>
+
+<div th:if="${qrCode != null}">
+    <img th:src="@{'data:image/png;base64,' + ${qrCode}}" alt="Authenticator QR Code"/>
+</div>
+<p>Manual key: <code th:text="${secret}">SECRET</code></p>
+
+<form th:action="@{/login/enroll}" method="post" autocomplete="off">
+    <div>
+        <label for="otp">Confirmation code:</label>
+        <input type="text" id="otp" name="otp" inputmode="numeric" pattern="[0-9]*" maxlength="6" required autofocus/>
+    </div>
+    <div>
+        <button type="submit">Confirm Enrollment &amp; Sign In</button>
+    </div>
+</form>
+<p><a th:href="@{/login}">Cancel</a></p>
+</body>
+</html>

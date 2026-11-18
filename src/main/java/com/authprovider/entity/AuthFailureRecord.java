@@ -26,6 +26,8 @@ public class AuthFailureRecord {
 
     public static final String SCOPE_RADIUS = "RADIUS";
     public static final String SCOPE_MFA_PREAUTH = "MFA_PREAUTH";
+    public static final String SCOPE_ADMIN = "ADMIN";
+    public static final String SCOPE_OTP_TOKEN = "OTP_TOKEN";
     /**
      * Account-wide failure tracking (keyed by user id) shared by every authentication channel. It reuses
      * the historical RADIUS scope name so existing records keep their meaning.

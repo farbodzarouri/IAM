@@ -27,7 +27,11 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@SpringBootTest(properties = {"radius.port=0", "radius.shared-secret=testing123", "radius.mfa.ttl-seconds=60"})
+@SpringBootTest(properties = {
+        "radius.port=0",
+        "iam.bootstrap.radius.shared-secret=testing123",
+        "iam.bootstrap.policy.mfa-approval-ttl-seconds=60"
+})
 @AutoConfigureMockMvc
 class RadiusServerIntegrationTest {
 

@@ -8,6 +8,8 @@ import java.util.Locale;
  */
 public final class UsernameNormalizer {
 
+    private static final int DEFAULT_MAX_LENGTH = 256;
+
     private UsernameNormalizer() {
     }
 
@@ -18,6 +20,31 @@ public final class UsernameNormalizer {
         }
         String name = stripped.toLowerCase(Locale.ROOT);
         return name.isEmpty() ? null : name;
+    }
+
+    /**
+     * Trims a presented login username and rejects blank, oversized, or control-character input.
+     *
+     * @return sanitized username, or {@code null} when invalid
+     */
+    public static String sanitizeLoginUsername(String username) {
+        return sanitizeLoginUsername(username, DEFAULT_MAX_LENGTH);
+    }
+
+    public static String sanitizeLoginUsername(String username, int maxLength) {
+        if (username == null) {
+            return null;
+        }
+        String trimmed = username.trim();
+        if (trimmed.isEmpty() || trimmed.length() > maxLength) {
+            return null;
+        }
+        for (int i = 0; i < trimmed.length(); i++) {
+            if (Character.isISOControl(trimmed.charAt(i))) {
+                return null;
+            }
+        }
+        return trimmed;
     }
 
     /** Removes a {@code DOMAIN\\} prefix and an {@code @realm} suffix while preserving case. */

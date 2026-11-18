@@ -45,6 +45,11 @@ public class RadiusClient {
     @Column(name = "active", nullable = false)
     private boolean active = true;
 
+    /** Optional per-client authentication mode override (null inherits SecurityPolicy default). */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "auth_mode", length = 32)
+    private AuthMode authMode;
+
     @Column(name = "description", length = 512)
     private String description;
 

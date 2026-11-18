@@ -19,7 +19,7 @@ import java.time.Instant;
 @AllArgsConstructor
 @Entity
 @Table(name = "otp_replay_state", uniqueConstraints = {
-        @UniqueConstraint(name = "uk_otp_replay_state_user", columnNames = {"user_id"})
+        @UniqueConstraint(name = "uk_otp_replay_state_subject", columnNames = {"subject_key"})
 })
 public class OtpReplayState {
 
@@ -27,7 +27,10 @@ public class OtpReplayState {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "user_id", nullable = false)
+    @Column(name = "subject_key", nullable = false, length = 64)
+    private String subjectKey;
+
+    @Column(name = "user_id")
     private Long userId;
 
     @Column(name = "last_time_step", nullable = false)

@@ -1,5 +1,6 @@
 package com.authprovider.radius;
 
+import com.authprovider.entity.AuthMode;
 import com.authprovider.entity.RadiusClient;
 import com.authprovider.repository.RadiusClientRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -19,12 +20,9 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Resolves the RADIUS client (and therefore the shared secret used to validate and decrypt packets)
- * from the sender's network address. Clients are persisted as {@link RadiusClient} entities; the most
+ * Resolves the RADIUS client (shared secret and optional per-client {@link AuthMode}) from the
+ * sender's network address. Clients are persisted as {@link RadiusClient} entities; the most
  * specific active match wins (a discrete address beats a subnet, a longer prefix beats a shorter one).
- * <p>
- * When constructed without a repository (unit tests / embedded use) the legacy
- * {@code radius.shared-secret} / {@code radius.allowed-clients} properties are used.
  */
 @Slf4j
 @Component
@@ -32,27 +30,46 @@ public class RadiusClientRegistry {
 
     private static final int MAX_PARSED_CACHE = 10_000;
 
-    private final RadiusProperties properties;
     private final RadiusClientRepository repository;
+    private final String inMemorySecret;
+    private final List<String> inMemoryAllowedClients;
+    private final AuthMode inMemoryAuthMode;
     private final Map<String, Optional<CidrBlock>> parsedCache = new ConcurrentHashMap<>();
-    private final Map<String, Set<InetAddress>> legacyResolved = new ConcurrentHashMap<>();
+    private final Map<String, Set<InetAddress>> inMemoryResolved = new ConcurrentHashMap<>();
 
-    /** Resolved client identity and secret. */
-    public record ResolvedClient(Long id, String name, byte[] secret) {
+    /** Resolved client identity, shared secret, and optional authentication mode override. */
+    public record ResolvedClient(Long id, String name, byte[] secret, AuthMode authMode) {
+        public ResolvedClient(Long id, String name, byte[] secret) {
+            this(id, name, secret, null);
+        }
+
         @Override
         public String toString() {
-            return "ResolvedClient[id=" + id + ", name=" + name + "]";
+            return "ResolvedClient[id=" + id + ", name=" + name + ", authMode=" + authMode + "]";
         }
     }
 
-    public RadiusClientRegistry(RadiusProperties properties) {
-        this(properties, null);
+    @Autowired
+    public RadiusClientRegistry(RadiusClientRepository repository) {
+        this(repository, null, List.of(), null);
     }
 
-    @Autowired
-    public RadiusClientRegistry(RadiusProperties properties, RadiusClientRepository repository) {
-        this.properties = properties;
+    private RadiusClientRegistry(RadiusClientRepository repository,
+                                 String inMemorySecret,
+                                 List<String> inMemoryAllowedClients,
+                                 AuthMode inMemoryAuthMode) {
         this.repository = repository;
+        this.inMemorySecret = inMemorySecret;
+        this.inMemoryAllowedClients = inMemoryAllowedClients == null ? List.of() : List.copyOf(inMemoryAllowedClients);
+        this.inMemoryAuthMode = inMemoryAuthMode;
+    }
+
+    public static RadiusClientRegistry inMemory(String sharedSecret) {
+        return inMemory(sharedSecret, List.of(), null);
+    }
+
+    public static RadiusClientRegistry inMemory(String sharedSecret, List<String> allowedClients, AuthMode authMode) {
+        return new RadiusClientRegistry(null, sharedSecret, allowedClients, authMode);
     }
 
     public boolean isPersistent() {
@@ -65,7 +82,7 @@ public class RadiusClientRegistry {
             return Optional.empty();
         }
         if (repository == null) {
-            return resolveLegacy(address);
+            return resolveInMemory(address);
         }
         List<RadiusClient> clients = repository.findByActiveTrue();
         RadiusClient best = null;
@@ -87,21 +104,21 @@ public class RadiusClientRegistry {
             return Optional.empty();
         }
         return Optional.of(new ResolvedClient(best.getId(), best.getName(),
-                best.getSharedSecret().getBytes(StandardCharsets.UTF_8)));
+                best.getSharedSecret().getBytes(StandardCharsets.UTF_8), best.getAuthMode()));
     }
 
     /** Validates the configuration at server start-up and logs security warnings. */
     public void validate() {
         if (repository == null) {
-            Set<InetAddress> resolved = new HashSet<>();
-            for (String client : legacyClientEntries()) {
-                resolved.addAll(resolveLegacyEntry(client));
+            if (inMemorySecret == null || inMemorySecret.isEmpty()) {
+                throw new IllegalStateException("In-memory RADIUS client registry requires a non-empty shared secret");
             }
-            if (RadiusProperties.DEFAULT_SHARED_SECRET.equals(properties.getSharedSecret())) {
-                log.warn("RADIUS server is using the default shared secret; set radius.shared-secret to a strong value in production");
+            Set<InetAddress> resolved = new HashSet<>();
+            for (String client : inMemoryClientEntries()) {
+                resolved.addAll(resolveInMemoryEntry(client));
             }
             if (resolved.isEmpty()) {
-                log.warn("RADIUS server accepts requests from any client address; consider restricting radius.allowed-clients");
+                log.warn("RADIUS server accepts requests from any client address; consider restricting allowed clients");
             }
             return;
         }
@@ -118,9 +135,6 @@ public class RadiusClientRegistry {
             }
             if (client.getSharedSecret() == null || client.getSharedSecret().isEmpty()) {
                 log.error("RADIUS client '{}' has no shared secret and will never match", client.getName());
-            } else if (RadiusProperties.DEFAULT_SHARED_SECRET.equals(client.getSharedSecret())) {
-                log.warn("RADIUS client '{}' is using the default shared secret; configure a strong secret in production",
-                        client.getName());
             }
             if (block.get().getPrefixLength() == 0) {
                 log.warn("RADIUS client '{}' ({}) accepts requests from any address; consider restricting it",
@@ -160,43 +174,43 @@ public class RadiusClientRegistry {
         return parsed;
     }
 
-    private Optional<ResolvedClient> resolveLegacy(InetAddress address) {
-        List<String> entries = legacyClientEntries();
-        byte[] secret = properties.sharedSecretBytes();
+    private Optional<ResolvedClient> resolveInMemory(InetAddress address) {
+        if (inMemorySecret == null || inMemorySecret.isEmpty()) {
+            return Optional.empty();
+        }
+        List<String> entries = inMemoryClientEntries();
+        byte[] secret = inMemorySecret.getBytes(StandardCharsets.UTF_8);
         if (entries.isEmpty()) {
-            return Optional.of(new ResolvedClient(null, "default", secret));
+            return Optional.of(new ResolvedClient(null, "default", secret, inMemoryAuthMode));
         }
         for (String entry : entries) {
-            if (resolveLegacyEntry(entry).contains(address)) {
-                return Optional.of(new ResolvedClient(null, entry.trim(), secret));
+            if (resolveInMemoryEntry(entry).contains(address)) {
+                return Optional.of(new ResolvedClient(null, entry.trim(), secret, inMemoryAuthMode));
             }
             Optional<CidrBlock> block = parse(entry);
             if (block.isPresent() && block.get().matches(address)) {
-                return Optional.of(new ResolvedClient(null, entry.trim(), secret));
+                return Optional.of(new ResolvedClient(null, entry.trim(), secret, inMemoryAuthMode));
             }
         }
         return Optional.empty();
     }
 
-    private List<String> legacyClientEntries() {
-        if (properties.getAllowedClients() == null) {
-            return List.of();
-        }
-        return properties.getAllowedClients().stream()
+    private List<String> inMemoryClientEntries() {
+        return inMemoryAllowedClients.stream()
                 .filter(entry -> entry != null && !entry.isBlank())
                 .toList();
     }
 
-    private Set<InetAddress> resolveLegacyEntry(String client) {
+    private Set<InetAddress> resolveInMemoryEntry(String client) {
         String key = client.trim();
         if (CidrBlock.isValid(key) && key.contains("/")) {
             return Set.of();
         }
-        return legacyResolved.computeIfAbsent(key, entry -> {
+        return inMemoryResolved.computeIfAbsent(key, entry -> {
             try {
                 return Set.copyOf(Arrays.asList(InetAddress.getAllByName(entry)));
             } catch (UnknownHostException e) {
-                throw new IllegalStateException("Unable to resolve radius.allowed-clients entry: " + entry, e);
+                throw new IllegalStateException("Unable to resolve RADIUS client entry: " + entry, e);
             }
         });
     }

@@ -58,7 +58,23 @@ public class FederatedDirectoryAuthenticator implements DirectoryAuthenticator {
         if (qualifiedName == null || qualifiedName.isBlank() || password == null || password.isEmpty()) {
             return DirectoryAuthenticationResult.invalidCredentials();
         }
-        LdapDirectoryService.Route route = directoryService.route(qualifiedName, unqualifiedName);
+        return authenticateRoute(directoryService.route(qualifiedName, unqualifiedName), password);
+    }
+
+    @Override
+    public DirectoryAuthenticationResult authenticateAdmin(String username, String password) {
+        return authenticateAdminQualified(username, username, password);
+    }
+
+    @Override
+    public DirectoryAuthenticationResult authenticateAdminQualified(String qualifiedName, String unqualifiedName, String password) {
+        if (qualifiedName == null || qualifiedName.isBlank() || password == null || password.isEmpty()) {
+            return DirectoryAuthenticationResult.invalidCredentials();
+        }
+        return authenticateRoute(directoryService.routeAdmin(qualifiedName, unqualifiedName), password);
+    }
+
+    private DirectoryAuthenticationResult authenticateRoute(LdapDirectoryService.Route route, String password) {
         List<LdapDirectory> directories = route.directories();
         if (directories.isEmpty()) {
             return DirectoryAuthenticationResult.userNotFound();

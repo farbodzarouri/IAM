@@ -21,4 +21,13 @@ public interface DirectoryAuthenticator {
                                                                 String password) {
         return authenticate(unqualifiedName, password);
     }
+
+    default DirectoryAuthenticationResult authenticateAdmin(String username, String password) {
+        return authenticate(username, password);
+    }
+
+    default DirectoryAuthenticationResult authenticateAdminQualified(String qualifiedName, String unqualifiedName,
+                                                                     String password) {
+        return authenticateQualified(qualifiedName, unqualifiedName, password);
+    }
 }

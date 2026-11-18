@@ -78,11 +78,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest(properties = {
         "radius.port=0",
         "radius.bind-address=127.0.0.1",
-        "radius.shared-secret=cross-secret",
-        "radius.max-failures=3",
-        "radius.lockout-seconds=120",
-        "radius.mfa.ttl-seconds=60",
-        "radius.challenge.ttl-seconds=60"
+        "iam.bootstrap.radius.shared-secret=cross-secret",
+        "iam.bootstrap.policy.max-failures=3",
+        "iam.bootstrap.policy.lockout-seconds=120",
+        "iam.bootstrap.policy.mfa-approval-ttl-seconds=60",
+        "iam.bootstrap.policy.challenge-ttl-seconds=60"
 })
 @AutoConfigureMockMvc
 class CrossChannelSecurityIntegrationTest {
@@ -323,24 +323,24 @@ class CrossChannelSecurityIntegrationTest {
         return Boolean.TRUE.equals(mav.getModel().get("success"));
     }
 
-    private boolean postValidateOtp(Long userId, int otp) throws Exception {
-        String body = "{\"userId\":" + userId + ",\"otp\":" + otp + "}";
+    private boolean postValidateOtp(String username, int otp) throws Exception {
+        String body = "{\"username\":\"" + escapeJson(username) + "\",\"otp\":\"" + String.format("%06d", otp) + "\"}";
         MvcResult res = mockMvc.perform(post("/v1/api/otp/validate")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andReturn();
         int status = res.getResponse().getStatus();
         String content = res.getResponse().getContentAsString().trim();
-        if (status == 200 && "true".equals(content)) {
+        if (status == 200 && JSON.readTree(content).path("valid").asBoolean()) {
             return true;
         }
-        assertTrue(status >= 400 || "false".equals(content),
+        assertTrue(status >= 400 || !JSON.readTree(content).path("valid").asBoolean(),
                 "Unexpected /v1/api/otp/validate response: status=" + status + " body=" + content);
         return false;
     }
 
-    private boolean postValidateOcra(Long userId, String challenge, String otp) throws Exception {
-        String body = "{\"userId\":" + userId + ",\"challenge\":\"" + escapeJson(challenge)
+    private boolean postValidateOcra(String username, String challenge, String otp) throws Exception {
+        String body = "{\"username\":\"" + escapeJson(username) + "\",\"challenge\":\"" + escapeJson(challenge)
                 + "\",\"otp\":\"" + escapeJson(otp) + "\"}";
         MvcResult res = mockMvc.perform(post("/v1/api/otp/validate-ocra")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -348,10 +348,10 @@ class CrossChannelSecurityIntegrationTest {
                 .andReturn();
         int status = res.getResponse().getStatus();
         String content = res.getResponse().getContentAsString().trim();
-        if (status == 200 && "true".equals(content)) {
+        if (status == 200 && JSON.readTree(content).path("valid").asBoolean()) {
             return true;
         }
-        assertTrue(status >= 400 || "false".equals(content),
+        assertTrue(status >= 400 || !JSON.readTree(content).path("valid").asBoolean(),
                 "Unexpected /v1/api/otp/validate-ocra response: status=" + status + " body=" + content);
         return false;
     }
@@ -450,7 +450,7 @@ class CrossChannelSecurityIntegrationTest {
                     "Cross-channel LDAP authentications must reuse the same single local account");
 
             // Rotate LDAP user's OTP secret before testing directory-backed lockout so unused fresh codes exist
-            String rotatedLdapSecret = mockMvc.perform(post("/v1/api/otp/generate/" + ldapUserId))
+            String rotatedLdapSecret = mockMvc.perform(post("/v1/api/otp/generate/" + savedLdap.getUsername()))
                     .andExpect(status().isOk())
                     .andReturn().getResponse().getContentAsString().trim();
             long postRotStep = stableCurrentStep();
@@ -467,7 +467,7 @@ class CrossChannelSecurityIntegrationTest {
                     "Locked LDAP-backed account must be rejected on Web Login even with valid LDAP credentials and fresh OTP");
             assertFalse(postMfaPreAuth("CORP\\ldapuser", Integer.parseInt(postRotCodes[1])),
                     "Locked LDAP-backed account must be rejected on MFA Pre-Auth");
-            assertFalse(postValidateOtp(ldapUserId, Integer.parseInt(postRotCodes[2])),
+            assertFalse(postValidateOtp(savedLdap.getUsername(), Integer.parseInt(postRotCodes[2])),
                     "Locked LDAP-backed account must be rejected on /v1/api/otp/validate");
             assertEquals(RadiusConstants.ACCESS_REJECT,
                     sendRadius("ldapuser@corp.local", "LdapPass!123", null).getCode(),
@@ -499,16 +499,16 @@ class CrossChannelSecurityIntegrationTest {
         // Accumulate 3 failures across 3 distinct channels using mixed identity forms
         assertFalse(postWebLogin("CORP\\AlIcE", "WrongPassword!", null).path("authenticated").asBoolean());
         assertFalse(postMfaPreAuth("alice@corp.local", Integer.parseInt(wrongOtp)));
-        assertFalse(postValidateOtp(alice.getId(), Integer.parseInt(wrongOtp)));
+        assertFalse(postValidateOtp(alice.getUsername(), Integer.parseInt(wrongOtp)));
 
         // Every channel must now reject alice even with completely valid credentials and unused codes
         assertFalse(postWebLogin("alice", PASSWORD, validOtp).path("authenticated").asBoolean(),
                 "Locked user must be rejected on Web Login");
         assertFalse(postMfaPreAuth("alice", Integer.parseInt(validOtp)),
                 "Locked user must be rejected on MFA Pre-Auth");
-        assertFalse(postValidateOtp(alice.getId(), Integer.parseInt(validOtp)),
+        assertFalse(postValidateOtp(alice.getUsername(), Integer.parseInt(validOtp)),
                 "Locked user must be rejected on /v1/api/otp/validate");
-        assertFalse(postValidateOcra(alice.getId(), challenge, validOcra),
+        assertFalse(postValidateOcra(alice.getUsername(), challenge, validOcra),
                 "Locked user must be rejected on /v1/api/otp/validate-ocra");
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("alice", PASSWORD, null).getCode(),
                 "Locked user must be rejected on In-Band RADIUS");
@@ -528,7 +528,7 @@ class CrossChannelSecurityIntegrationTest {
         String wrongOcraOtp2 = String.format("%06d", (Integer.parseInt(validOcra2) + 123457) % 1_000_000);
 
         assertFalse(postWebLogin("CORP\\alice-step2", PASSWORD, wrongOtp2).path("authenticated").asBoolean());
-        assertFalse(postValidateOcra(aliceStep2.getId(), "12345678", wrongOcraOtp2));
+        assertFalse(postValidateOcra(aliceStep2.getUsername(), "12345678", wrongOcraOtp2));
         byte[] step2Challenge = obtainChallengeState("alice-step2");
         assertEquals(RadiusConstants.ACCESS_REJECT,
                 sendRadius("alice-step2@corp.local", wrongOtp2, step2Challenge).getCode());
@@ -537,9 +537,9 @@ class CrossChannelSecurityIntegrationTest {
                 "Step-2 cross-channel failures must lock Web Login");
         assertFalse(postMfaPreAuth("alice-step2", Integer.parseInt(validOtp2)),
                 "Step-2 cross-channel failures must lock MFA Pre-Auth");
-        assertFalse(postValidateOtp(aliceStep2.getId(), Integer.parseInt(validOtp2)),
+        assertFalse(postValidateOtp(aliceStep2.getUsername(), Integer.parseInt(validOtp2)),
                 "Step-2 cross-channel failures must lock /v1/api/otp/validate");
-        assertFalse(postValidateOcra(aliceStep2.getId(), "12345678", validOcra2),
+        assertFalse(postValidateOcra(aliceStep2.getUsername(), "12345678", validOcra2),
                 "Step-2 cross-channel failures must lock /v1/api/otp/validate-ocra");
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("alice-step2", PASSWORD, null).getCode(),
                 "Step-2 cross-channel failures must lock In-Band RADIUS");
@@ -563,8 +563,8 @@ class CrossChannelSecurityIntegrationTest {
         // Bob must now be blocked across all channels
         assertFalse(postWebLogin("bob", PASSWORD, validOtp).path("authenticated").asBoolean());
         assertFalse(postMfaPreAuth("bob", Integer.parseInt(validOtp)));
-        assertFalse(postValidateOtp(bob.getId(), Integer.parseInt(validOtp)));
-        assertFalse(postValidateOcra(bob.getId(), "87654321", validOcra));
+        assertFalse(postValidateOtp(bob.getUsername(), Integer.parseInt(validOtp)));
+        assertFalse(postValidateOcra(bob.getUsername(), "87654321", validOcra));
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("bob", PASSWORD, null).getCode());
     }
 
@@ -583,7 +583,7 @@ class CrossChannelSecurityIntegrationTest {
         assertEquals(RadiusConstants.ACCESS_ACCEPT, sendRadius("carol", otpForStep(secret, step - 1), state).getCode());
 
         // 2 more failures should NOT lock carol because the prior counter was cleared
-        assertFalse(postValidateOtp(carol.getId(), Integer.parseInt(wrongOtp)));
+        assertFalse(postValidateOtp(carol.getUsername(), Integer.parseInt(wrongOtp)));
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("carol", "wrong-pw", null).getCode());
         assertTrue(postWebLogin("carol", PASSWORD, otpForStep(secret, step)).path("authenticated").asBoolean(),
                 "Counter must have been reset by successful authentication");
@@ -658,7 +658,7 @@ class CrossChannelSecurityIntegrationTest {
         User otpClrUser = createUser("clr-otp", PASSWORD, otpClrSec);
         assertFalse(postWebLogin("clr-otp", "wrong-pw", null).path("authenticated").asBoolean());
         assertFalse(postMfaPreAuth("clr-otp", Integer.parseInt(wrongOtpForStep(otpClrSec, otpClrStep))));
-        assertTrue(postValidateOtp(otpClrUser.getId(), Integer.parseInt(otpForStep(otpClrSec, otpClrStep))));
+        assertTrue(postValidateOtp(otpClrUser.getUsername(), Integer.parseInt(otpForStep(otpClrSec, otpClrStep))));
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("clr-otp", "wrong-pw", null).getCode());
         assertFalse(postWebLogin("clr-otp", "wrong-pw", null).path("authenticated").asBoolean());
         assertEquals(RadiusConstants.ACCESS_CHALLENGE, sendRadius("clr-otp", PASSWORD, null).getCode(),
@@ -670,10 +670,10 @@ class CrossChannelSecurityIntegrationTest {
         User ocraClrUser = createUser("clr-ocra", PASSWORD, ocraClrSec);
         assertFalse(postWebLogin("clr-ocra", "wrong-pw", null).path("authenticated").asBoolean());
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("clr-ocra", "wrong-pw", null).getCode());
-        assertTrue(postValidateOcra(ocraClrUser.getId(), "13572468",
+        assertTrue(postValidateOcra(ocraClrUser.getUsername(), "13572468",
                 ocraService.generateOcra(ocraClrSec, "13572468")));
         assertFalse(postMfaPreAuth("clr-ocra", Integer.parseInt(wrongOtpForStep(ocraClrSec, ocraClrStep))));
-        assertFalse(postValidateOtp(ocraClrUser.getId(), Integer.parseInt(wrongOtpForStep(ocraClrSec, ocraClrStep))));
+        assertFalse(postValidateOtp(ocraClrUser.getUsername(), Integer.parseInt(wrongOtpForStep(ocraClrSec, ocraClrStep))));
         assertEquals(RadiusConstants.ACCESS_CHALLENGE, sendRadius("clr-ocra", PASSWORD, null).getCode(),
                 "/v1/api/otp/validate-ocra success must clear shared failure counter");
     }
@@ -694,7 +694,7 @@ class CrossChannelSecurityIntegrationTest {
         // Replaying exact step T must fail on every channel
         assertFalse(postWebLogin("mono-alice", PASSWORD, otpT).path("authenticated").asBoolean());
         assertFalse(postMfaPreAuth("mono-alice", Integer.parseInt(otpT)));
-        assertFalse(postValidateOtp(alice.getId(), Integer.parseInt(otpT)));
+        assertFalse(postValidateOtp(alice.getUsername(), Integer.parseInt(otpT)));
         byte[] stateReplayT = obtainChallengeState("mono-alice");
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("mono-alice", otpT, stateReplayT).getCode());
 
@@ -703,7 +703,7 @@ class CrossChannelSecurityIntegrationTest {
                 "Older time step T-1 must be rejected after step T was accepted");
         assertFalse(postMfaPreAuth("mono-alice", Integer.parseInt(otpTMinus1)),
                 "Older time step T-1 must be rejected on MFA Pre-Auth after step T was accepted");
-        assertFalse(postValidateOtp(alice.getId(), Integer.parseInt(otpTMinus1)),
+        assertFalse(postValidateOtp(alice.getUsername(), Integer.parseInt(otpTMinus1)),
                 "Older time step T-1 must be rejected on /v1/api/otp/validate after step T was accepted");
         byte[] stateOlder = obtainChallengeState("mono-alice");
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("mono-alice", otpTMinus1, stateOlder).getCode(),
@@ -732,11 +732,11 @@ class CrossChannelSecurityIntegrationTest {
         String ocra2 = ocraService.generateOcra(secret, ch2);
 
         // First OCRA validation succeeds
-        assertTrue(postValidateOcra(u.getId(), ch1, ocra1));
+        assertTrue(postValidateOcra(u.getUsername(), ch1, ocra1));
         // Second validation of the same challenge + code fails (single-use)
-        assertFalse(postValidateOcra(u.getId(), ch1, ocra1), "Replaying consumed OCRA code must be rejected");
+        assertFalse(postValidateOcra(u.getUsername(), ch1, ocra1), "Replaying consumed OCRA code must be rejected");
         // Another valid challenge still works (unless locked out — we still have < maxFailures=3)
-        assertTrue(postValidateOcra(u.getId(), ch2, ocra2));
+        assertTrue(postValidateOcra(u.getUsername(), ch2, ocra2));
 
         // Concurrently submitting a valid OCRA challenge across 4 threads allows only 1 winner
         String ch3 = "55667788";
@@ -769,10 +769,10 @@ class CrossChannelSecurityIntegrationTest {
         // Now repeated OCRA replay/invalid attempts count toward shared cross-channel lockout
         String ch4 = "99887766";
         String ocra4 = ocraService.generateOcra(secret, ch4);
-        assertFalse(postValidateOcra(u.getId(), ch1, "000000"));
-        assertFalse(postValidateOcra(u.getId(), ch1, "000000"));
-        assertFalse(postValidateOcra(u.getId(), ch1, "000000"));
-        assertFalse(postValidateOcra(u.getId(), ch4, ocra4), "Locked user must be rejected on OCRA even for fresh challenge");
+        assertFalse(postValidateOcra(u.getUsername(), ch1, "000000"));
+        assertFalse(postValidateOcra(u.getUsername(), ch1, "000000"));
+        assertFalse(postValidateOcra(u.getUsername(), ch1, "000000"));
+        assertFalse(postValidateOcra(u.getUsername(), ch4, ocra4), "Locked user must be rejected on OCRA even for fresh challenge");
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("ocra-user", PASSWORD, null).getCode(),
                 "OCRA failure lockout must propagate to RADIUS");
     }
@@ -889,8 +889,8 @@ class CrossChannelSecurityIntegrationTest {
             assertFalse(postWebLogin(uname, PASSWORD, skewOtpTMinus1).path("authenticated").asBoolean());
             assertFalse(postMfaPreAuth(uname, Integer.parseInt(skewOtpT)));
             assertFalse(postMfaPreAuth(uname, Integer.parseInt(skewOtpTMinus1)));
-            assertFalse(postValidateOtp(skewUser.getId(), Integer.parseInt(skewOtpT)));
-            assertFalse(postValidateOtp(skewUser.getId(), Integer.parseInt(skewOtpTMinus1)));
+            assertFalse(postValidateOtp(skewUser.getUsername(), Integer.parseInt(skewOtpT)));
+            assertFalse(postValidateOtp(skewUser.getUsername(), Integer.parseInt(skewOtpTMinus1)));
             byte[] postSt1 = obtainChallengeState(uname);
             assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius(uname, skewOtpT, postSt1).getCode());
             byte[] postSt2 = obtainChallengeState(uname);
@@ -1024,7 +1024,7 @@ class CrossChannelSecurityIntegrationTest {
                     "Account locked via concurrent failures must be blocked on Web Login");
             assertFalse(postMfaPreAuth(uname, Integer.parseInt(codes[2])),
                     "Account locked via concurrent failures must be blocked on MFA Pre-Auth");
-            assertFalse(postValidateOtp(failUser.getId(), Integer.parseInt(codes[2])),
+            assertFalse(postValidateOtp(failUser.getUsername(), Integer.parseInt(codes[2])),
                     "Account locked via concurrent failures must be blocked on /v1/api/otp/validate");
             assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius(uname, PASSWORD, null).getCode(),
                     "Account locked via concurrent failures must be blocked on In-Band RADIUS");
@@ -1040,9 +1040,9 @@ class CrossChannelSecurityIntegrationTest {
                 "--radius.enabled=true",
                 "--radius.port=0",
                 "--radius.bind-address=127.0.0.1",
-                "--radius.shared-secret=cluster-secret",
-                "--radius.max-failures=3",
-                "--radius.lockout-seconds=120",
+                "--iam.bootstrap.radius.shared-secret=cluster-secret",
+                "--iam.bootstrap.policy.max-failures=3",
+                "--iam.bootstrap.policy.lockout-seconds=120",
                 "--spring.datasource.url=" + dbUrl,
                 "--spring.jpa.hibernate.ddl-auto=update");
     }
@@ -1117,7 +1117,7 @@ class CrossChannelSecurityIntegrationTest {
         assertTrue(postMfaPreAuth("rot-user", Integer.parseInt(otpForStep(rotSecret, rotStep - 1))));
         byte[] rotState = obtainChallengeState("rot-user");
 
-        String rotatedSecret = mockMvc.perform(post("/v1/api/otp/generate/" + rotUser.getId()))
+        String rotatedSecret = mockMvc.perform(post("/v1/api/otp/generate/" + rotUser.getUsername()))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString().trim();
         assertNotEquals(rotSecret, rotatedSecret);
@@ -1243,7 +1243,7 @@ class CrossChannelSecurityIntegrationTest {
         byte[] aliceState2 = obtainChallengeState("alice");
         assertEquals(1, challengeRepository.count());
 
-        mockMvc.perform(post("/v1/api/otp/generate/" + partnerId))
+        mockMvc.perform(post("/v1/api/otp/generate/alice@partner.example"))
                 .andExpect(status().isOk());
         mockMvc.perform(delete("/v1/api/users/" + partnerId))
                 .andExpect(status().is2xxSuccessful());
@@ -1278,9 +1278,9 @@ class CrossChannelSecurityIntegrationTest {
                 "REST MFA Pre-Auth must remain locked during mfaLockoutWindowSeconds");
         assertFalse(postWebLogin("mfa-web", PASSWORD, validOtp).path("authenticated").asBoolean(),
                 "Web Login must remain locked past lockoutSeconds when MFA pre-auth triggered mfaLockoutWindowSeconds");
-        assertFalse(postValidateOtp(mfaWebUser.getId(), Integer.parseInt(validOtp)),
+        assertFalse(postValidateOtp(mfaWebUser.getUsername(), Integer.parseInt(validOtp)),
                 "/v1/api/otp/validate must remain locked during mfaLockoutWindowSeconds");
-        assertFalse(postValidateOcra(mfaWebUser.getId(), "11223344", validOcra),
+        assertFalse(postValidateOcra(mfaWebUser.getUsername(), "11223344", validOcra),
                 "/v1/api/otp/validate-ocra must remain locked during mfaLockoutWindowSeconds");
         assertEquals(RadiusConstants.ACCESS_REJECT, sendRadius("mfa-web", PASSWORD, null).getCode(),
                 "In-band RADIUS must remain locked during mfaLockoutWindowSeconds");

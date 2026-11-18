@@ -1,19 +1,21 @@
 package com.authprovider.config;
 
+import com.authprovider.dto.AdminRequest;
 import com.authprovider.entity.LdapDirectory;
 import com.authprovider.entity.RadiusClient;
 import com.authprovider.entity.SecurityPolicy;
 import com.authprovider.ldap.JndiLdapDirectoryAuthenticator;
 import com.authprovider.ldap.LdapDirectoryService;
 import com.authprovider.radius.CidrBlock;
-import com.authprovider.radius.RadiusProperties;
+import com.authprovider.repository.AdminRepository;
 import com.authprovider.repository.LdapDirectoryRepository;
 import com.authprovider.repository.RadiusClientRepository;
 import com.authprovider.repository.SecurityPolicyRepository;
+import com.authprovider.service.AdminService;
 import com.authprovider.service.SecurityPolicyService;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -27,17 +29,19 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Populates the runtime configuration tables from the legacy configuration properties when the
- * application starts against an uninitialized database:
+ * Seeds initial database records when tables are empty on first boot:
  * <ul>
- *     <li>{@code security_policies}: the {@code default} policy from {@code radius.max-failures},
- *     {@code radius.lockout-seconds}, {@code radius.challenge.*} and {@code radius.mfa.ttl-seconds};</li>
- *     <li>{@code radius_clients}: one client per {@code radius.allowed-clients} entry (or a catch-all client
- *     when the list is empty) using {@code radius.shared-secret};</li>
- *     <li>{@code ldap_directories}: the directory described by the {@code ldap.*} properties.</li>
+ *     <li>{@code security_policies}: the built-in {@code default} policy (plus any optional
+ *     {@code iam.bootstrap.policy.*} overrides);</li>
+ *     <li>{@code radius_clients}: seeded only when {@code iam.bootstrap.radius.shared-secret} is
+ *     supplied externally;</li>
+ *     <li>{@code ldap_directories}: seeded only when {@code ldap.enabled=true} or {@code ldap.url} is
+ *     configured;</li>
+ *     <li>{@code admins}: seeded only when {@code iam.bootstrap.admin.username} and
+ *     {@code iam.bootstrap.admin.password} are supplied externally.</li>
  * </ul>
- * Each table is only seeded while empty, so records managed at runtime are never overwritten. Concurrent
- * seeding by several cluster nodes is tolerated.
+ * Each table is only populated when empty, so runtime changes persisted in the database are never
+ * overwritten.
  */
 @Slf4j
 @Component
@@ -49,37 +53,45 @@ public class DatabaseConfigurationBootstrap {
 
     private final RadiusProperties radiusProperties;
     private final LdapProperties ldapProperties;
+    private final BootstrapProperties bootstrapProperties;
     private final SecurityPolicyRepository policyRepository;
     private final RadiusClientRepository clientRepository;
     private final LdapDirectoryRepository directoryRepository;
+    private final AdminService adminService;
+    private final AdminRepository adminRepository;
     private final TransactionTemplate transactionTemplate;
-    private final boolean enabled;
 
+    @Autowired
     public DatabaseConfigurationBootstrap(RadiusProperties radiusProperties,
                                           LdapProperties ldapProperties,
+                                          BootstrapProperties bootstrapProperties,
                                           SecurityPolicyRepository policyRepository,
                                           RadiusClientRepository clientRepository,
                                           LdapDirectoryRepository directoryRepository,
-                                          PlatformTransactionManager transactionManager,
-                                          @Value("${iam.bootstrap.seed-defaults:true}") boolean enabled) {
+                                          AdminService adminService,
+                                          AdminRepository adminRepository,
+                                          PlatformTransactionManager transactionManager) {
         this.radiusProperties = radiusProperties;
         this.ldapProperties = ldapProperties;
+        this.bootstrapProperties = bootstrapProperties;
         this.policyRepository = policyRepository;
         this.clientRepository = clientRepository;
         this.directoryRepository = directoryRepository;
+        this.adminService = adminService;
+        this.adminRepository = adminRepository;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
-        this.enabled = enabled;
     }
 
     @PostConstruct
     public void seed() {
-        if (!enabled) {
+        if (bootstrapProperties == null || !bootstrapProperties.isSeedDefaults()) {
             log.info("Seeding of default configuration records is disabled (iam.bootstrap.seed-defaults=false)");
             return;
         }
         seedSecurityPolicy();
         seedRadiusClients();
         seedLdapDirectories();
+        seedBootstrapAdmin();
     }
 
     void seedSecurityPolicy() {
@@ -87,11 +99,25 @@ public class DatabaseConfigurationBootstrap {
             if (policyRepository.findByName(SecurityPolicy.DEFAULT_NAME).isPresent()) {
                 return;
             }
-            SecurityPolicy policy = SecurityPolicyService.defaultsFromProperties(radiusProperties);
-            try {
-                policy.validate();
-            } catch (IllegalStateException e) {
-                log.warn("Configured security settings are invalid ({}); seeding built-in defaults", e.getMessage());
+            SecurityPolicy policy = SecurityPolicy.builder().name(SecurityPolicy.DEFAULT_NAME).build();
+            BootstrapProperties.Policy overrides = bootstrapProperties.getPolicy();
+            if (overrides != null) {
+                if (overrides.getMaxFailures() != null) {
+                    policy.setMaxFailures(overrides.getMaxFailures());
+                }
+                if (overrides.getLockoutSeconds() != null) {
+                    policy.setLockoutSeconds(overrides.getLockoutSeconds());
+                    policy.setFailureWindowSeconds(overrides.getLockoutSeconds());
+                }
+                if (overrides.getChallengeTtlSeconds() != null) {
+                    policy.setChallengeTtlSeconds(overrides.getChallengeTtlSeconds());
+                }
+                if (overrides.getMfaApprovalTtlSeconds() != null) {
+                    policy.setMfaApprovalTtlSeconds(overrides.getMfaApprovalTtlSeconds());
+                }
+            }
+            if (!SecurityPolicyService.isValid(policy)) {
+                log.warn("Configured bootstrap security policy overrides are invalid; seeding built-in defaults");
                 policy = SecurityPolicy.builder().name(SecurityPolicy.DEFAULT_NAME).build();
             }
             policyRepository.saveAndFlush(policy);
@@ -106,12 +132,13 @@ public class DatabaseConfigurationBootstrap {
             if (clientRepository.count() > 0) {
                 return;
             }
-            String secret = radiusProperties.getSharedSecret();
+            BootstrapProperties.Radius radiusSeed = bootstrapProperties.getRadius();
+            String secret = radiusSeed == null ? null : radiusSeed.getSharedSecret();
             if (secret == null || secret.isEmpty()) {
-                log.warn("radius.shared-secret is empty; no default RADIUS client seeded");
+                log.info("No iam.bootstrap.radius.shared-secret supplied; RADIUS clients are managed in the database");
                 return;
             }
-            Map<String, String> clients = legacyClients();
+            Map<String, String> clients = resolveSeedClients(radiusSeed.getAllowedClients());
             List<RadiusClient> entities = new ArrayList<>();
             for (Map.Entry<String, String> client : clients.entrySet()) {
                 entities.add(RadiusClient.builder()
@@ -119,11 +146,11 @@ public class DatabaseConfigurationBootstrap {
                         .address(client.getValue())
                         .sharedSecret(secret)
                         .active(true)
-                        .description("Seeded from radius.shared-secret / radius.allowed-clients")
+                        .description("Seeded from iam.bootstrap.radius.*")
                         .build());
             }
             clientRepository.saveAllAndFlush(entities);
-            log.info("Seeded {} RADIUS client(s) from configuration properties", entities.size());
+            log.info("Seeded {} RADIUS client(s) from bootstrap properties", entities.size());
         });
     }
 
@@ -132,8 +159,13 @@ public class DatabaseConfigurationBootstrap {
             if (directoryRepository.count() > 0) {
                 return;
             }
+            boolean hasUrl = ldapProperties.getUrl() != null && !ldapProperties.getUrl().isBlank();
+            if (!ldapProperties.isEnabled() && !hasUrl) {
+                log.info("No bootstrap LDAP directory configured; LDAP directories are managed in the database");
+                return;
+            }
             if (ldapProperties.isEnabled()) {
-                // Fail fast on an invalid directory configuration, as before.
+                // Fail fast on an invalid directory configuration.
                 new JndiLdapDirectoryAuthenticator(ldapProperties).validateConfiguration();
             }
             LdapDirectory directory = LdapDirectoryService.fromProperties(DEFAULT_DIRECTORY_NAME, ldapProperties);
@@ -143,11 +175,45 @@ public class DatabaseConfigurationBootstrap {
         });
     }
 
-    /** name -> address (IP or CIDR) for the legacy single-secret client configuration. */
-    private Map<String, String> legacyClients() {
+    void seedBootstrapAdmin() {
+        BootstrapProperties.Admin adminSeed = bootstrapProperties.getAdmin();
+        if (adminSeed == null || !adminSeed.isEnabled()
+                || adminService == null || adminRepository == null) {
+            return;
+        }
+        String username = adminSeed.getUsername();
+        String password = adminSeed.getPassword();
+        if (username == null || username.isBlank() || password == null || password.isBlank()) {
+            if (adminRepository.count() == 0) {
+                log.info("No bootstrap admin credentials supplied (iam.bootstrap.admin.username/password); complete first-run /setup or configure in the database");
+            }
+            return;
+        }
+        runSeed("bootstrap admin", () -> {
+            if (adminRepository.count() > 0) {
+                return;
+            }
+            String trimmedUser = username.trim();
+            if (adminRepository.findByUsername(trimmedUser).isPresent()) {
+                return;
+            }
+            String displayName = adminSeed.getDisplayName() == null || adminSeed.getDisplayName().isBlank()
+                    ? trimmedUser
+                    : adminSeed.getDisplayName().trim();
+            adminService.createAdmin(AdminRequest.builder()
+                    .username(trimmedUser)
+                    .password(password)
+                    .displayName(displayName)
+                    .enabled(true)
+                    .build());
+            log.info("Seeded bootstrap admin '{}'", trimmedUser);
+        });
+    }
+
+    private Map<String, String> resolveSeedClients(List<String> rawAllowed) {
         Map<String, String> clients = new LinkedHashMap<>();
-        List<String> allowed = radiusProperties.getAllowedClients() == null ? List.of()
-                : radiusProperties.getAllowedClients().stream().filter(c -> c != null && !c.isBlank()).map(String::trim).toList();
+        List<String> allowed = rawAllowed == null ? List.of()
+                : rawAllowed.stream().filter(c -> c != null && !c.isBlank()).map(String::trim).toList();
         if (allowed.isEmpty()) {
             clients.put(DEFAULT_CLIENT_NAME, "0.0.0.0/0");
             clients.put(DEFAULT_IPV6_CLIENT_NAME, "::/0");
@@ -171,9 +237,9 @@ public class DatabaseConfigurationBootstrap {
                 }
             } catch (UnknownHostException e) {
                 if (radiusProperties.isEnabled()) {
-                    throw new IllegalStateException("Unable to resolve radius.allowed-clients entry: " + entry, e);
+                    throw new IllegalStateException("Unable to resolve iam.bootstrap.radius.allowed-clients entry: " + entry, e);
                 }
-                log.warn("Unable to resolve radius.allowed-clients entry '{}'; skipped", entry);
+                log.warn("Unable to resolve iam.bootstrap.radius.allowed-clients entry '{}'; skipped", entry);
             }
         }
         return clients;
@@ -193,7 +259,6 @@ public class DatabaseConfigurationBootstrap {
         try {
             transactionTemplate.executeWithoutResult(status -> seed.run());
         } catch (DataIntegrityViolationException e) {
-            // Another node seeded the same table concurrently.
             log.info("Default {} already seeded by another node", what);
         }
     }

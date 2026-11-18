@@ -4,6 +4,7 @@ import com.authprovider.config.LdapProperties;
 import com.authprovider.dto.LoginRequest;
 import com.authprovider.dto.LoginResponse;
 import com.authprovider.entity.AuthAuditLog;
+import com.authprovider.entity.AuthMode;
 import com.authprovider.entity.User;
 import com.authprovider.ldap.DirectoryAuthenticationResult;
 import com.authprovider.ldap.DirectoryAuthenticator;
@@ -11,12 +12,8 @@ import com.authprovider.ldap.DirectoryConfiguration;
 import com.authprovider.ldap.LdapPropertiesDirectoryConfiguration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.time.Clock;
 import java.util.regex.Pattern;
 
@@ -24,29 +21,26 @@ import java.util.regex.Pattern;
 @Service
 public class LoginServiceImpl implements LoginService {
 
-    static final String ISSUER = "IAM";
     static final String SOURCE_DIRECTORY = "LDAP";
     static final String SOURCE_LOCAL = "LOCAL";
-    private static final int QR_CODE_SIZE = 200;
-    private static final int MAX_USERNAME_LENGTH = 256;
+    private static final int OTP_LENGTH = 6;
     private static final int MAX_PASSWORD_LENGTH = 1024;
     private static final Pattern OTP_PATTERN = Pattern.compile("^\\d{1,6}$");
-    private static final String DUMMY_HASH = new BCryptPasswordEncoder().encode("\u0000dummy-password\u0000");
 
     private final DirectoryConfiguration directoryConfiguration;
     private final DirectoryAuthenticator directoryAuthenticator;
     private final UserService userService;
     private final SecretGenerator secretGenerator;
-    private final TotpService totpService;
     private final QrCodeGenerator qrCodeGenerator;
     private final AuthAuditService auditService;
     private final OtpVerificationService otpVerifier;
     private final AccountLockoutService lockoutService;
+    private final SecurityPolicyService policyService;
+    private final PasswordService passwordService;
     /** Resolves the account that authenticates (local login / directory linking / provisioning). */
-    private final AccountResolver accountResolver;
+    private final AccountResolver<User> accountResolver;
     /** Resolves the account a request applies to for lockout purposes, before any credential is checked. */
-    private final AccountResolver lockoutSubjectResolver;
-    private final BCryptPasswordEncoder bcryptEncoder = new BCryptPasswordEncoder();
+    private final AccountResolver<User> lockoutSubjectResolver;
     private final Object provisioningLock = new Object();
 
     /** Internal result carrying the audit details next to the API response. */
@@ -59,19 +53,15 @@ public class LoginServiceImpl implements LoginService {
                             SecretGenerator secretGenerator,
                             TotpService totpService,
                             QrCodeGenerator qrCodeGenerator) {
-        this(new LdapPropertiesDirectoryConfiguration(ldapProperties), directoryAuthenticator, userService,
-                secretGenerator, totpService, qrCodeGenerator, AuthAuditService.noOp());
-    }
-
-    public LoginServiceImpl(DirectoryConfiguration directoryConfiguration,
-                            DirectoryAuthenticator directoryAuthenticator,
-                            UserService userService,
-                            SecretGenerator secretGenerator,
-                            TotpService totpService,
-                            QrCodeGenerator qrCodeGenerator,
-                            AuthAuditService auditService) {
-        this(directoryConfiguration, directoryAuthenticator, userService, secretGenerator, totpService,
-                qrCodeGenerator, auditService, sharedVerifier(userService, totpService));
+        this(new LdapPropertiesDirectoryConfiguration(ldapProperties),
+                directoryAuthenticator,
+                userService,
+                secretGenerator,
+                qrCodeGenerator,
+                AuthAuditService.noOp(),
+                OtpVerificationService.inMemory(totpService, null, Clock.systemUTC()),
+                SecurityPolicyService.withDefaults(),
+                PasswordService.withDefaults());
     }
 
     @Autowired
@@ -79,30 +69,23 @@ public class LoginServiceImpl implements LoginService {
                             DirectoryAuthenticator directoryAuthenticator,
                             UserService userService,
                             SecretGenerator secretGenerator,
-                            TotpService totpService,
                             QrCodeGenerator qrCodeGenerator,
                             AuthAuditService auditService,
-                            OtpVerificationService otpVerifier) {
+                            OtpVerificationService otpVerifier,
+                            SecurityPolicyService policyService,
+                            PasswordService passwordService) {
         this.directoryConfiguration = directoryConfiguration;
         this.directoryAuthenticator = directoryAuthenticator;
         this.userService = userService;
         this.secretGenerator = secretGenerator;
-        this.totpService = totpService;
         this.qrCodeGenerator = qrCodeGenerator;
         this.auditService = auditService == null ? AuthAuditService.noOp() : auditService;
-        this.otpVerifier = otpVerifier == null ? sharedVerifier(userService, totpService) : otpVerifier;
+        this.otpVerifier = otpVerifier == null ? OtpVerificationService.inMemory(null, null, Clock.systemUTC()) : otpVerifier;
         this.lockoutService = this.otpVerifier.lockoutService();
-        this.accountResolver = new AccountResolver(userService::findAllByUsernameIgnoreCase, null);
-        this.lockoutSubjectResolver = new AccountResolver(userService::findByUsernameIgnoreCase, null);
-    }
-
-    private static OtpVerificationService sharedVerifier(UserService userService, TotpService totpService) {
-        AccountSecuritySupport support = AccountSecuritySupport.of(userService);
-        if (support != null && support.accountLockoutService() != null) {
-            AccountLockoutService lockout = support.accountLockoutService();
-            return new OtpVerificationService(totpService, null, support.otpUsageStore(), lockout, lockout.clock());
-        }
-        return OtpVerificationService.inMemory(totpService, null, Clock.systemUTC());
+        this.policyService = policyService == null ? SecurityPolicyService.withDefaults() : policyService;
+        this.passwordService = passwordService == null ? PasswordService.withDefaults() : passwordService;
+        this.accountResolver = new AccountResolver<>(userService::findAllByUsernameIgnoreCase, null);
+        this.lockoutSubjectResolver = new AccountResolver<>(userService::findByUsernameIgnoreCase, null);
     }
 
     @Override
@@ -144,9 +127,23 @@ public class LoginServiceImpl implements LoginService {
         if (request == null) {
             return result(failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required"));
         }
-        String username = normalizeUsername(request.getUsername());
+        String username = UsernameNormalizer.sanitizeLoginUsername(request.getUsername());
         String password = request.getPassword();
-        if (username == null || password == null || password.isEmpty() || password.length() > MAX_PASSWORD_LENGTH) {
+        if (username == null || (password != null && password.length() > MAX_PASSWORD_LENGTH)) {
+            return result(failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required"));
+        }
+        if (password == null || password.isEmpty()) {
+            AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, isStripRealm());
+            if (resolution.isFound() && effectiveAuthMode(resolution.user()) == AuthMode.OTP_ONLY) {
+                return authenticateOtpOnly(resolution.user(), request.getOtp());
+            }
+            if (!resolution.isFound() && resolution.status() != AccountResolver.Status.AMBIGUOUS
+                    && policyDefaultAuthMode() == AuthMode.OTP_ONLY) {
+                return result(invalidCredentials());
+            }
+            if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
+                return result(invalidCredentials());
+            }
             return result(failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required"));
         }
 
@@ -159,13 +156,31 @@ public class LoginServiceImpl implements LoginService {
     private Outcome authenticateWithDirectory(String username, String password, String otp) {
         // Lockouts are enforced before the directory bind so that a locked account cannot be used to
         // probe (or lock out) the directory account.
-        User lockSubject = lockoutSubjectResolver.resolve(username, true).user();
-        if (lockSubject != null && lockoutService.isLocked(lockSubject.getId())) {
+        User lockSubject = lockoutSubjectResolver.resolve(username, isStripRealm()).user();
+        if (isBlocked(lockSubject)) {
             return locked(lockSubject);
         }
+        AuthMode preMode = effectiveAuthMode(lockSubject);
+        if (preMode == AuthMode.OTP_ONLY) {
+            return authenticateOtpOnly(lockSubject, otp);
+        }
+
+        String bindPassword = password;
+        String effectiveOtp = otp;
+        if (preMode == AuthMode.PASSWORD_AND_OTP_INLINE && (otp == null || otp.isBlank())) {
+            if (!hasTrailingSixDigits(password) || password.length() <= OTP_LENGTH) {
+                if (lockSubject != null) {
+                    lockoutService.recordFailure(lockSubject.getId());
+                }
+                return result(invalidCredentials());
+            }
+            bindPassword = password.substring(0, password.length() - OTP_LENGTH);
+            effectiveOtp = password.substring(password.length() - OTP_LENGTH);
+        }
+
         DirectoryAuthenticationResult result;
         try {
-            result = directoryAuthenticator.authenticate(username, password);
+            result = directoryAuthenticator.authenticate(username, bindPassword);
         } catch (RuntimeException e) {
             log.error("Directory authentication failed unexpectedly", e);
             result = DirectoryAuthenticationResult.unavailable();
@@ -178,7 +193,7 @@ public class LoginServiceImpl implements LoginService {
             case AUTHENTICATED:
                 String canonical = result.username() != null && !result.username().isBlank()
                         ? result.username() : username;
-                return completeDirectoryLogin(canonical, otp, directoryConfiguration.isAutoProvision(result));
+                return completeDirectoryLogin(canonical, effectiveOtp, directoryConfiguration.isAutoProvision(result));
             case USER_NOT_FOUND:
                 if (directoryConfiguration.isFallbackToLocal(username)) {
                     return authenticateLocal(username, password, otp);
@@ -200,7 +215,7 @@ public class LoginServiceImpl implements LoginService {
         synchronized (provisioningLock) {
             // The directory's canonical name is authoritative: it is linked as is (no realm stripping),
             // exactly like RADIUS links directory identities (see PrimaryCredentialVerifier#findLinkedAccount).
-            AccountResolver.Resolution resolution = accountResolver.resolve(username, false);
+            AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, false);
             if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
                 log.error("Multiple local accounts match directory user {}; refusing to link", username);
                 return result(failure(LoginResponse.Status.ACCOUNT_CONFLICT, "Account cannot be resolved uniquely"));
@@ -210,46 +225,130 @@ public class LoginServiceImpl implements LoginService {
                     return result(failure(LoginResponse.Status.NOT_PROVISIONED, "Account is not provisioned"));
                 }
                 log.info("Provisioning local account for directory user {}", username);
-                Outcome provisioned = enrollOutcome(User.builder().username(username).build(), SOURCE_DIRECTORY);
-                if (provisioned.response().getStatus() != LoginResponse.Status.ENROLLMENT_FAILED) {
-                    return provisioned;
-                }
-                // Another node may have provisioned the same account concurrently: link to it instead.
-                resolution = accountResolver.resolve(username, false);
-                if (!resolution.isFound()) {
-                    return provisioned;
+                if (policyDefaultAuthMode() == AuthMode.PASSWORD_ONLY) {
+                    User created = provisionWithoutSecret(username);
+                    if (created != null) {
+                        lockoutService.recordSuccess(created.getId());
+                        return authenticatedOutcome(created, SOURCE_DIRECTORY);
+                    }
+                    resolution = accountResolver.resolve(username, false);
+                    if (!resolution.isFound()) {
+                        return result(failure(LoginResponse.Status.ENROLLMENT_FAILED, "Unable to provision account"));
+                    }
+                } else {
+                    Outcome provisioned = enrollOutcome(User.builder().username(username).build(), SOURCE_DIRECTORY);
+                    if (provisioned.response().getStatus() != LoginResponse.Status.ENROLLMENT_FAILED) {
+                        return provisioned;
+                    }
+                    // Another node may have provisioned the same account concurrently: link to it instead.
+                    resolution = accountResolver.resolve(username, false);
+                    if (!resolution.isFound()) {
+                        return provisioned;
+                    }
                 }
             }
             user = resolution.user();
         }
-        if (lockoutService.isLocked(user.getId())) {
+        if (isBlocked(user)) {
             return locked(user);
+        }
+        AuthMode mode = effectiveAuthMode(user);
+        if (mode == AuthMode.PASSWORD_ONLY) {
+            lockoutService.recordSuccess(user.getId());
+            return authenticatedOutcome(user, SOURCE_DIRECTORY);
+        }
+        if (mode == AuthMode.OTP_ONLY) {
+            return authenticateOtpOnly(user, otp);
         }
         return verifySecondFactor(user, SOURCE_DIRECTORY, otp);
     }
 
+    private User provisionWithoutSecret(String username) {
+        try {
+            return userService.saveUser(User.builder().username(username).build());
+        } catch (RuntimeException e) {
+            log.warn("Unable to auto-provision password-only user '{}': {}", username, e.getMessage());
+            return null;
+        }
+    }
+
     private Outcome authenticateLocal(String username, String password, String otp) {
-        AccountResolver.Resolution resolution = accountResolver.resolve(username, true);
+        AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, isStripRealm());
         if (!resolution.isFound()) {
             if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
                 log.error("Multiple local accounts share username {}; refusing authentication", username);
             }
-            simulatePasswordCheck(password);
+            passwordService.simulateCheck(password);
             return result(invalidCredentials());
         }
         User user = resolution.user();
-        if (lockoutService.isLocked(user.getId())) {
-            simulatePasswordCheck(password);
+        if (isBlocked(user)) {
+            passwordService.simulateCheck(password);
             return locked(user);
         }
-        if (!passwordMatches(user.getPassword(), password)) {
+        AuthMode mode = effectiveAuthMode(user);
+        if (mode == AuthMode.OTP_ONLY) {
+            return authenticateOtpOnly(user, otp);
+        }
+
+        String candidatePassword = password;
+        String effectiveOtp = otp;
+        if (mode == AuthMode.PASSWORD_AND_OTP_INLINE && (otp == null || otp.isBlank())) {
+            if (!hasTrailingSixDigits(password) || password.length() <= OTP_LENGTH) {
+                lockoutService.recordFailure(user.getId());
+                return result(invalidCredentials());
+            }
+            candidatePassword = password.substring(0, password.length() - OTP_LENGTH);
+            effectiveOtp = password.substring(password.length() - OTP_LENGTH);
+        }
+
+        if (!passwordService.matches(user.getPassword(), candidatePassword)) {
             lockoutService.recordFailure(user.getId());
             return result(invalidCredentials());
         }
-        return verifySecondFactor(user, SOURCE_LOCAL, otp);
+        if (mode == AuthMode.PASSWORD_ONLY) {
+            lockoutService.recordSuccess(user.getId());
+            return authenticatedOutcome(user, SOURCE_LOCAL);
+        }
+        return verifySecondFactor(user, SOURCE_LOCAL, effectiveOtp);
+    }
+
+    private Outcome authenticateOtpOnly(User user, String otp) {
+        if (user == null) {
+            return result(invalidCredentials());
+        }
+        if (isBlocked(user)) {
+            return locked(user);
+        }
+        if (user.getSecret() == null || user.getSecret().isBlank()) {
+            return result(failure(LoginResponse.Status.NOT_PROVISIONED, "OTP token is not enrolled"));
+        }
+        if (otp == null || otp.isBlank()) {
+            return result(failure(LoginResponse.Status.OTP_REQUIRED, "One-time password is required"));
+        }
+        String code = otp.trim();
+        if (!OTP_PATTERN.matcher(code).matches()) {
+            // OTP-only login has no verified first factor: record account lockout only, never token lockout.
+            lockoutService.recordFailure(user.getId());
+            return result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
+        }
+        OtpVerificationService.Result verification = otpVerifier.verifyTotp(user, Integer.parseInt(code), false);
+        return switch (verification) {
+            case ACCEPTED -> authenticatedOutcome(user, SOURCE_LOCAL);
+            case LOCKED -> locked(user);
+            case NOT_ENROLLED -> result(failure(LoginResponse.Status.NOT_PROVISIONED, "OTP token is not enrolled"));
+            case REPLAYED -> {
+                log.warn("Rejected replayed TOTP for user {}", user.getUsername());
+                yield result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
+            }
+            case INVALID -> result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
+        };
     }
 
     private Outcome verifySecondFactor(User user, String source, String otp) {
+        if (isBlocked(user)) {
+            return locked(user);
+        }
         if (user.getSecret() == null || user.getSecret().isBlank()) {
             synchronized (provisioningLock) {
                 return enrollOutcome(user, source);
@@ -260,13 +359,16 @@ public class LoginServiceImpl implements LoginService {
         }
         String code = otp.trim();
         if (!OTP_PATTERN.matcher(code).matches()) {
-            if (lockoutService.isLocked(user.getId())) {
+            if (isBlocked(user)) {
                 return locked(user);
             }
             lockoutService.recordFailure(user.getId());
+            if (user.getOtpToken() != null && user.getOtpToken().getId() != null) {
+                lockoutService.recordTokenFailure(user.getOtpToken().getId());
+            }
             return result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
         }
-        OtpVerificationService.Result verification = otpVerifier.verifyTotp(user, Integer.parseInt(code));
+        OtpVerificationService.Result verification = otpVerifier.verifyTotp(user, Integer.parseInt(code), true);
         switch (verification) {
             case ACCEPTED:
                 break;
@@ -280,6 +382,35 @@ public class LoginServiceImpl implements LoginService {
             default:
                 return result(failure(LoginResponse.Status.INVALID_OTP, "Invalid one-time password"));
         }
+        return authenticatedOutcome(user, source);
+    }
+
+    private AuthMode effectiveAuthMode(User user) {
+        return user != null && user.getAuthMode() != null ? user.getAuthMode() : policyDefaultAuthMode();
+    }
+
+    private AuthMode policyDefaultAuthMode() {
+        return policyService.current().getDefaultAuthMode();
+    }
+
+    private boolean isStripRealm() {
+        return policyService.current().isStripRealm();
+    }
+
+    private static boolean hasTrailingSixDigits(String value) {
+        if (value == null || value.length() < OTP_LENGTH) {
+            return false;
+        }
+        for (int i = value.length() - OTP_LENGTH; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static Outcome authenticatedOutcome(User user, String source) {
         return result(LoginResponse.builder()
                 .status(LoginResponse.Status.AUTHENTICATED)
                 .authenticated(true)
@@ -301,10 +432,12 @@ public class LoginServiceImpl implements LoginService {
     private Outcome enrollOutcome(User user, String source) {
         LoginResponse response = enroll(user, source);
         if (response.getStatus() == LoginResponse.Status.ENROLLMENT_REQUIRED && response.getUserId() != null) {
-            // A new secret invalidates anything pending for the account.
             try {
                 lockoutService.invalidatePendingSessions(response.getUserId());
                 otpVerifier.usageStore().resetOcraChallenges(response.getUserId());
+                if (user.getOtpToken() != null && user.getOtpToken().getId() != null) {
+                    otpVerifier.usageStore().resetTokenOcraChallenges(user.getOtpToken().getId());
+                }
             } catch (RuntimeException e) {
                 log.error("Unable to invalidate pending sessions after enrollment of {}", user.getUsername(), e);
             }
@@ -312,29 +445,33 @@ public class LoginServiceImpl implements LoginService {
         return result(response);
     }
 
+    private boolean isBlocked(User user) {
+        if (user == null) {
+            return false;
+        }
+        if (!user.isAccountEnabled()) {
+            return true;
+        }
+        if (lockoutService.isLocked(user.getId())) {
+            return true;
+        }
+        return user.getOtpToken() != null && lockoutService.isTokenLocked(user.getOtpToken().getId());
+    }
+
     private static Outcome result(LoginResponse response) {
         return new Outcome(response, false);
     }
 
-    /**
-     * Locked accounts receive the same response as invalid credentials (no account state disclosure and
-     * no change of the API contract); the audit log records the lockout.
-     */
     private static Outcome locked(User user) {
         log.warn("Web login refused for locked-out account '{}'", user.getUsername());
         return new Outcome(invalidCredentials(), true);
     }
 
-    private void simulatePasswordCheck(String password) {
-        bcryptEncoder.matches(password, DUMMY_HASH);
-    }
-
     private LoginResponse enroll(User user, String source) {
         String secret = secretGenerator.generateSecret();
-        String otpAuthUri = qrCodeGenerator.generateOtpAuthUrl(ISSUER, encodeLabel(user.getUsername()), secret);
-        String qrCode;
+        OtpProvisioningSupport.ProvisioningQr qr;
         try {
-            qrCode = qrCodeGenerator.generateQrCodeImage(otpAuthUri, QR_CODE_SIZE, QR_CODE_SIZE);
+            qr = OtpProvisioningSupport.generate(qrCodeGenerator, user.getUsername(), secret);
         } catch (Exception e) {
             log.error("Failed to generate enrollment QR code for {}", user.getUsername(), e);
             return failure(LoginResponse.Status.ENROLLMENT_FAILED, "Unable to initialize two-factor enrollment");
@@ -360,52 +497,10 @@ public class LoginServiceImpl implements LoginService {
                 .username(saved.getUsername())
                 .authenticationSource(source)
                 .secret(secret)
-                .otpAuthUri(otpAuthUri)
-                .qrCode(qrCode)
-                .issuer(ISSUER)
+                .otpAuthUri(qr.otpAuthUri())
+                .qrCode(qr.qrCode())
+                .issuer(OtpProvisioningSupport.DEFAULT_ISSUER)
                 .build();
-    }
-
-    private static String normalizeUsername(String username) {
-        if (username == null) {
-            return null;
-        }
-        String trimmed = username.trim();
-        if (trimmed.isEmpty() || trimmed.length() > MAX_USERNAME_LENGTH) {
-            return null;
-        }
-        for (int i = 0; i < trimmed.length(); i++) {
-            if (Character.isISOControl(trimmed.charAt(i))) {
-                return null;
-            }
-        }
-        return trimmed;
-    }
-
-    private boolean passwordMatches(String stored, String provided) {
-        if (stored == null || stored.isEmpty() || provided == null) {
-            return false;
-        }
-        if (stored.startsWith("$2a$") || stored.startsWith("$2b$") || stored.startsWith("$2y$")) {
-            return bcryptEncoder.matches(provided, stored);
-        }
-        if (stored.startsWith("{bcrypt}")) {
-            return bcryptEncoder.matches(provided, stored.substring("{bcrypt}".length()));
-        }
-        if (stored.startsWith("{noop}")) {
-            return constantTimeEquals(provided, stored.substring("{noop}".length()));
-        }
-        return constantTimeEquals(provided, stored);
-    }
-
-    private static boolean constantTimeEquals(String a, String b) {
-        return MessageDigest.isEqual(
-                a.getBytes(StandardCharsets.UTF_8),
-                b.getBytes(StandardCharsets.UTF_8));
-    }
-
-    private static String encodeLabel(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
     private static LoginResponse invalidCredentials() {

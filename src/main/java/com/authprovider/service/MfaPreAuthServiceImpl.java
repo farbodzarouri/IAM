@@ -42,7 +42,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
     }
 
     private final UserService userService;
-    private final AccountResolver accountResolver;
+    private final AccountResolver<User> accountResolver;
     private final Clock clock;
     private final SecurityPolicyService policyService;
     private final AuthFailureStore failureStore;
@@ -61,20 +61,8 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
                                  TotpService totpService,
                                  Clock clock,
                                  long ttlSeconds) {
-        this(userService, totpService, clock, validatedTtlPolicy(ttlSeconds), new InMemoryAuthFailureStore(),
-                null, null, AuthAuditService.noOp());
-    }
-
-    public MfaPreAuthServiceImpl(UserService userService,
-                                 TotpService totpService,
-                                 Clock clock,
-                                 SecurityPolicyService policyService,
-                                 AuthFailureStore failureStore,
-                                 MfaApprovalRepository approvalRepository,
-                                 PlatformTransactionManager transactionManager,
-                                 AuthAuditService auditService) {
-        this(userService, clock, policyService, failureStore, approvalRepository, transactionManager, auditService,
-                sharedVerifier(userService, totpService, clock, policyService, failureStore));
+        this(userService, clock, validatedTtlPolicy(ttlSeconds), new InMemoryAuthFailureStore(),
+                null, null, AuthAuditService.noOp(), OtpVerificationService.inMemory(totpService, null, clock));
     }
 
     @Autowired
@@ -87,7 +75,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
                                  AuthAuditService auditService,
                                  OtpVerificationService otpVerifier) {
         this.userService = userService;
-        this.accountResolver = new AccountResolver(userService::findByUsernameIgnoreCase, null);
+        this.accountResolver = new AccountResolver<>(userService::findByUsernameIgnoreCase, null);
         this.clock = clock;
         this.policyService = policyService;
         this.failureStore = failureStore;
@@ -101,23 +89,6 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
             // Node-local approvals must be discarded by this instance itself.
             lockoutService.sessionInvalidator().addListener(this::invalidateApprovals);
         }
-    }
-
-    /**
-     * Builds a verifier joining the application's shared security state when the user service exposes it,
-     * otherwise a lockout tracker on the given failure store and node-local replay state.
-     */
-    private static OtpVerificationService sharedVerifier(UserService userService, TotpService totpService, Clock clock,
-                                                         SecurityPolicyService policyService,
-                                                         AuthFailureStore failureStore) {
-        AccountSecuritySupport support = AccountSecuritySupport.of(userService);
-        PendingAuthSessionInvalidator invalidator = support == null ? null : support.sessionInvalidator();
-        OtpUsageStore usageStore = support == null ? null : support.otpUsageStore();
-        AccountLockoutService lockout = support != null && support.accountLockoutService() != null
-                && support.accountLockoutService().failureStore() == failureStore
-                ? support.accountLockoutService()
-                : new AccountLockoutService(policyService, failureStore, clock, invalidator);
-        return new OtpVerificationService(totpService, null, usageStore, lockout, clock);
     }
 
     private static SecurityPolicyService validatedTtlPolicy(long ttlSeconds) {
@@ -142,7 +113,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
         SecurityPolicy policy = policyService.current();
         purgeIfDue(now, policy);
 
-        AccountResolver.Resolution resolution = accountResolver.resolve(username, true);
+        AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, true);
         User user = resolution.user();
         String key;
         if (user != null && user.getUsername() != null) {
@@ -163,6 +134,12 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
             Long auditUserId = user == null ? null : user.getId();
             log.warn("MFA pre-authentication rejected for locked-out user '{}'", auditKey);
             audit(AuthAuditLog.Outcome.LOCKED, auditKey, auditUserId, "LOCKED_OUT");
+            return false;
+        }
+
+        if (user != null && (!user.isAccountEnabled() || isTokenLocked(user))) {
+            log.warn("MFA pre-authentication rejected for disabled or token-locked account '{}'", user.getUsername());
+            audit(AuthAuditLog.Outcome.LOCKED, key, user.getId(), "LOCKED_OUT");
             return false;
         }
 
@@ -223,7 +200,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
             return false;
         }
         Instant now = clock.instant();
-        if (lockoutService.isLocked(userId)) {
+        if (isAccountOrTokenBlocked(userId, null)) {
             invalidateApprovals(userId);
             return false;
         }
@@ -275,7 +252,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
                 approvals.remove(key, pending);
                 return false;
             }
-            if (lockoutService.isLocked(pending.userId())) {
+            if (isAccountOrTokenBlocked(pending.userId(), null)) {
                 approvals.remove(key, pending);
                 return false;
             }
@@ -291,7 +268,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
             approvalRepository.deleteByIdReturningCount(approval.getId());
             return false;
         }
-        if (lockoutService.isLocked(approval.getUserId())) {
+        if (isAccountOrTokenBlocked(approval.getUserId(), null)) {
             approvalRepository.deleteByIdReturningCount(approval.getId());
             return false;
         }
@@ -320,7 +297,24 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
             }
             userId = approval.get().getUserId();
         }
-        return !lockoutService.isLocked(userId);
+        return !isAccountOrTokenBlocked(userId, null);
+    }
+
+    private boolean isTokenLocked(User user) {
+        return user != null && user.getOtpToken() != null && user.getOtpToken().getId() != null
+                && lockoutService.isTokenLocked(user.getOtpToken().getId());
+    }
+
+    private boolean isAccountOrTokenBlocked(Long userId, User knownUser) {
+        if (userId != null && lockoutService.isLocked(userId)) {
+            return true;
+        }
+        User user = knownUser != null ? knownUser
+                : (userService == null || userId == null ? null : userService.getUserById(userId));
+        if (user != null) {
+            return !user.isAccountEnabled() || isTokenLocked(user);
+        }
+        return false;
     }
 
     @Override

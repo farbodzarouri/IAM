@@ -18,6 +18,7 @@ import com.authprovider.repository.UserRepository;
 import com.authprovider.service.AuthAuditService;
 import com.authprovider.service.AuthFailureStore;
 import com.authprovider.service.MfaPreAuthServiceImpl;
+import com.authprovider.service.OtpVerificationService;
 import com.authprovider.service.SecurityPolicyService;
 import com.authprovider.service.TotpService;
 import com.authprovider.service.UserService;
@@ -38,11 +39,11 @@ import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest(properties = {
         "radius.port=0",
         "radius.bind-address=127.0.0.1",
-        "radius.shared-secret=persist-secret",
-        "radius.challenge.ttl-seconds=33",
-        "radius.max-failures=3",
-        "radius.lockout-seconds=120",
-        "radius.mfa.ttl-seconds=42"
+        "iam.bootstrap.radius.shared-secret=persist-secret",
+        "iam.bootstrap.policy.challenge-ttl-seconds=33",
+        "iam.bootstrap.policy.max-failures=3",
+        "iam.bootstrap.policy.lockout-seconds=120",
+        "iam.bootstrap.policy.mfa-approval-ttl-seconds=42"
 })
 class PersistentRadiusStateIntegrationTest {
 
@@ -63,6 +64,7 @@ class PersistentRadiusStateIntegrationTest {
     @Autowired private SecurityPolicyService policyService;
     @Autowired private AuthFailureStore failureStore;
     @Autowired private AuthAuditService auditService;
+    @Autowired private OtpVerificationService otpVerificationService;
     @Autowired private PlatformTransactionManager transactionManager;
     @Autowired private Clock clock;
     @Autowired private com.authprovider.service.LoginService loginService;
@@ -101,8 +103,7 @@ class PersistentRadiusStateIntegrationTest {
                 && "persist-secret".equals(c.getSharedSecret()) && c.isActive()));
 
         List<LdapDirectory> directories = directoryRepository.findAll();
-        assertEquals(1, directories.size());
-        assertFalse(directories.get(0).isEnabled());
+        assertEquals(0, directories.size());
     }
 
     @Test
@@ -206,10 +207,10 @@ class PersistentRadiusStateIntegrationTest {
 
     @Test
     void mfaApprovalIsPersistedAndConsumableByAnotherNode() {
-        MfaPreAuthServiceImpl nodeA = new MfaPreAuthServiceImpl(userService, totpService, clock, policyService,
-                failureStore, approvalRepository, transactionManager, auditService);
-        MfaPreAuthServiceImpl nodeB = new MfaPreAuthServiceImpl(userService, totpService, clock, policyService,
-                failureStore, approvalRepository, transactionManager, auditService);
+        MfaPreAuthServiceImpl nodeA = new MfaPreAuthServiceImpl(userService, clock, policyService,
+                failureStore, approvalRepository, transactionManager, auditService, otpVerificationService);
+        MfaPreAuthServiceImpl nodeB = new MfaPreAuthServiceImpl(userService, clock, policyService,
+                failureStore, approvalRepository, transactionManager, auditService, otpVerificationService);
 
         assertTrue(nodeA.preAuthenticate("persist-user", totpService.generateOtp(SECRET)));
         Optional<MfaApproval> stored = approvalRepository.findByUsername("persist-user");
@@ -224,8 +225,8 @@ class PersistentRadiusStateIntegrationTest {
 
     @Test
     void mfaFailuresAreTrackedPersistently() {
-        MfaPreAuthServiceImpl service = new MfaPreAuthServiceImpl(userService, totpService, clock, policyService,
-                failureStore, approvalRepository, transactionManager, auditService);
+        MfaPreAuthServiceImpl service = new MfaPreAuthServiceImpl(userService, clock, policyService,
+                failureStore, approvalRepository, transactionManager, auditService, otpVerificationService);
         int valid = totpService.generateOtp(SECRET);
         int wrong = (valid + 1) % 1_000_000;
         for (int i = 0; i < 5; i++) {
@@ -233,8 +234,8 @@ class PersistentRadiusStateIntegrationTest {
         }
         assertEquals(5, failureRepository.findByScopeAndSubject(AuthFailureRecord.SCOPE_MFA_PREAUTH, "persist-user")
                 .orElseThrow().getFailureCount());
-        MfaPreAuthServiceImpl restarted = new MfaPreAuthServiceImpl(userService, totpService, clock, policyService,
-                failureStore, approvalRepository, transactionManager, auditService);
+        MfaPreAuthServiceImpl restarted = new MfaPreAuthServiceImpl(userService, clock, policyService,
+                failureStore, approvalRepository, transactionManager, auditService, otpVerificationService);
         assertFalse(restarted.preAuthenticate("persist-user", valid));
         assertTrue(auditRepository.findByChannelOrderByIdAsc(AuthAuditLog.Channel.MFA_PREAUTH).stream()
                 .anyMatch(a -> "LOCKED_OUT".equals(a.getReason())));

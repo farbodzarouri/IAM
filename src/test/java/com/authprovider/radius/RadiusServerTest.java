@@ -1,7 +1,10 @@
 package com.authprovider.radius;
 
+import com.authprovider.config.RadiusProperties;
+import com.authprovider.entity.SecurityPolicy;
 import com.authprovider.entity.User;
 import com.authprovider.repository.UserRepository;
+import com.authprovider.service.SecurityPolicyService;
 import com.authprovider.service.UserOtpService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -34,6 +37,7 @@ class RadiusServerTest {
     private static final int VALID_OTP = 123456;
 
     private RadiusProperties properties;
+    private SecurityPolicy policy;
     private MutableClock clock;
     private UserRepository userRepository;
     private UserOtpService userOtpService;
@@ -47,9 +51,14 @@ class RadiusServerTest {
         properties = new RadiusProperties();
         properties.setPort(0);
         properties.setBindAddress("127.0.0.1");
-        properties.setSharedSecret(SECRET);
-        properties.getChallenge().setTtlSeconds(60);
-        properties.setMaxFailures(3);
+
+        policy = SecurityPolicy.builder()
+                .name(SecurityPolicy.DEFAULT_NAME)
+                .challengeTtlSeconds(60)
+                .maxFailures(3)
+                .build();
+        SecurityPolicyService policyService = SecurityPolicyService.inMemory(policy);
+        RadiusClientRegistry clientRegistry = RadiusClientRegistry.inMemory(SECRET);
 
         clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         userRepository = mock(UserRepository.class);
@@ -60,14 +69,15 @@ class RadiusServerTest {
         when(userRepository.findByUsername(anyString())).thenReturn(Optional.empty());
         when(userRepository.findByUsername("alice")).thenReturn(Optional.of(alice));
         when(userRepository.findByUsername("bob")).thenReturn(Optional.of(bob));
-        when(userOtpService.validateUserOtp(anyLong(), any())).thenReturn(Optional.of(false));
-        when(userOtpService.validateUserOtp(1L, VALID_OTP)).thenReturn(Optional.of(true));
+        when(userOtpService.validatePrimaryVerifiedOtp(anyLong(), any())).thenReturn(Optional.of(false));
+        when(userOtpService.validatePrimaryVerifiedOtp(1L, VALID_OTP)).thenReturn(Optional.of(true));
 
-        challengeStore = new RadiusChallengeStore(properties, clock, new SecureRandom());
-        RadiusAuthGuard guard = new RadiusAuthGuard(properties, clock);
-        handler = new RadiusAuthenticationHandler(properties,
-                new PrimaryCredentialVerifier(userRepository, properties), userOtpService, challengeStore, guard);
-        server = new RadiusServer(properties, handler, challengeStore, guard, clock);
+        challengeStore = new RadiusChallengeStore(policyService, clock, new SecureRandom());
+        RadiusAuthGuard guard = new RadiusAuthGuard(policyService, clock);
+        handler = new RadiusAuthenticationHandler(
+                new PrimaryCredentialVerifier(userRepository), userOtpService, challengeStore, guard,
+                clientRegistry, policyService);
+        server = new RadiusServer(properties, handler, challengeStore, guard, clock, clientRegistry);
         server.start();
         assertTrue(server.isRunning());
         client = new RadiusTestClient(server.getLocalPort(), SECRET);
@@ -183,7 +193,7 @@ class RadiusServerTest {
 
     @Test
     void challengeTtlIsConfigurable() throws Exception {
-        properties.getChallenge().setTtlSeconds(5);
+        policy.setChallengeTtlSeconds(5);
         RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("alice", PASSWORD, null));
         assertEquals(5, challenge.getAttribute(ATTR_SESSION_TIMEOUT).orElseThrow().getValueAsInteger());
         clock.advance(Duration.ofSeconds(5));
@@ -193,6 +203,8 @@ class RadiusServerTest {
 
     @Test
     void otpCannotBeReusedForAnotherChallenge() throws Exception {
+        when(userOtpService.validatePrimaryVerifiedOtp(1L, VALID_OTP))
+                .thenReturn(Optional.of(true), Optional.of(false));
         byte[] first = obtainChallenge("alice");
         assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(client.accessRequest("alice", "123456", first)).getCode());
         byte[] second = obtainChallenge("alice");
@@ -213,7 +225,7 @@ class RadiusServerTest {
         assertEquals(ACCESS_ACCEPT, accept.getCode());
         RadiusPacket acceptAgain = client.sendExpectingResponse(second);
         assertArrayEquals(accept.getRawBytes(), acceptAgain.getRawBytes());
-        verify(userOtpService, times(1)).validateUserOtp(eq(1L), any());
+        verify(userOtpService, times(1)).validatePrimaryVerifiedOtp(eq(1L), any());
     }
 
     @Test
@@ -250,7 +262,7 @@ class RadiusServerTest {
 
     @Test
     void messageAuthenticatorCanBeRequired() throws Exception {
-        properties.setRequireMessageAuthenticator(true);
+        policy.setRequireMessageAuthenticator(true);
         assertTrue(client.send(client.accessRequest("alice", PASSWORD, null, List.of(), false)).isEmpty());
         assertEquals(ACCESS_CHALLENGE, client.sendExpectingResponse(client.accessRequest("alice", PASSWORD, null)).getCode());
     }
@@ -289,7 +301,7 @@ class RadiusServerTest {
             assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("alice", "wrong", null)).getCode());
         }
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("alice", PASSWORD, null)).getCode());
-        clock.advance(Duration.ofSeconds(properties.getLockoutSeconds() + 1));
+        clock.advance(Duration.ofSeconds(policy.getLockoutSeconds() + 1));
         assertEquals(ACCESS_CHALLENGE, client.sendExpectingResponse(client.accessRequest("alice", PASSWORD, null)).getCode());
     }
 
@@ -303,7 +315,7 @@ class RadiusServerTest {
 
     @Test
     void challengeCapacityIsBounded() throws Exception {
-        properties.getChallenge().setMaxPending(1);
+        policy.setChallengeMaxPending(1);
         obtainChallenge("alice");
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("alice", PASSWORD, null)).getCode());
     }

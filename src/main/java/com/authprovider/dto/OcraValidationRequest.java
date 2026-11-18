@@ -10,7 +10,7 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 @AllArgsConstructor
 public class OcraValidationRequest {
-    private Long userId;
+    private String username;
     private String challenge;
     private String otp;
 }

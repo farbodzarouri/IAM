@@ -4,7 +4,12 @@
     <title>User Management</title>
 </head>
 <body>
-<h1>User Management</h1>
+<div style="display:flex; justify-content:space-between; align-items:center;">
+    <h1>User Management</h1>
+    <form th:action="@{/logout}" method="post">
+        <button type="submit">Sign Out</button>
+    </form>
+</div>
 
 <h2>Add User</h2>
 <form th:action="@{/users/add}" method="post">

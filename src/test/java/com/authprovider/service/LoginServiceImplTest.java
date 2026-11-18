@@ -53,8 +53,8 @@ public class LoginServiceImplTest {
     @Test
     void defaultsMatchSpecification() {
         assertFalse(properties.isEnabled());
-        assertEquals("ldap://localhost:389", properties.getUrl());
-        assertEquals("dc=example,dc=org", properties.getBaseDn());
+        assertNull(properties.getUrl());
+        assertNull(properties.getBaseDn());
         assertEquals("(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))", properties.getUserSearchFilter());
         assertTrue(properties.isAutoProvision());
         assertFalse(properties.isFallbackToLocal());

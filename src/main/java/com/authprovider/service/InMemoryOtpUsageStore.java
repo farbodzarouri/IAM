@@ -11,16 +11,64 @@ import java.util.concurrent.ConcurrentHashMap;
 /** Node-local {@link OtpUsageStore}, used when no database is available (e.g. unit tests). */
 public class InMemoryOtpUsageStore implements OtpUsageStore {
 
-    private final Map<Long, Long> lastTimeSteps = new ConcurrentHashMap<>();
-    private final Map<Long, Set<String>> usedChallenges = new ConcurrentHashMap<>();
+    private final Map<String, Long> lastTimeSteps = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> usedChallenges = new ConcurrentHashMap<>();
 
     @Override
     public boolean consumeTimeStep(Long userId, long timeStep) {
-        if (userId == null) {
-            return false;
+        return userId != null && consumeTimeStepKey(userKey(userId), timeStep);
+    }
+
+    @Override
+    public boolean consumeTokenTimeStep(Long tokenId, long timeStep) {
+        return tokenId != null && consumeTimeStepKey(tokenKey(tokenId), timeStep);
+    }
+
+    @Override
+    public boolean consumeOcraChallenge(Long userId, String challenge) {
+        return userId != null && consumeOcraChallengeKey(userKey(userId), challenge);
+    }
+
+    @Override
+    public boolean consumeTokenOcraChallenge(Long tokenId, String challenge) {
+        return tokenId != null && consumeOcraChallengeKey(tokenKey(tokenId), challenge);
+    }
+
+    @Override
+    public void resetOcraChallenges(Long userId) {
+        if (userId != null) {
+            usedChallenges.remove(userKey(userId));
         }
+    }
+
+    @Override
+    public void resetTokenOcraChallenges(Long tokenId) {
+        if (tokenId != null) {
+            usedChallenges.remove(tokenKey(tokenId));
+        }
+    }
+
+    @Override
+    public void forgetUser(Long userId) {
+        if (userId != null) {
+            String key = userKey(userId);
+            lastTimeSteps.remove(key);
+            usedChallenges.remove(key);
+        }
+    }
+
+    @Override
+    public void forgetToken(Long tokenId) {
+        if (tokenId != null) {
+            String key = tokenKey(tokenId);
+            lastTimeSteps.remove(key);
+            usedChallenges.remove(key);
+        }
+    }
+
+    private boolean consumeTimeStepKey(String subjectKey, long timeStep) {
         boolean[] accepted = {false};
-        lastTimeSteps.compute(userId, (id, previous) -> {
+        lastTimeSteps.compute(subjectKey, (id, previous) -> {
             if (previous == null || timeStep > previous) {
                 accepted[0] = true;
                 return timeStep;
@@ -30,27 +78,19 @@ public class InMemoryOtpUsageStore implements OtpUsageStore {
         return accepted[0];
     }
 
-    @Override
-    public boolean consumeOcraChallenge(Long userId, String challenge) {
-        if (userId == null || challenge == null) {
+    private boolean consumeOcraChallengeKey(String subjectKey, String challenge) {
+        if (challenge == null) {
             return false;
         }
-        return usedChallenges.computeIfAbsent(userId, id -> ConcurrentHashMap.newKeySet()).add(hash(challenge));
+        return usedChallenges.computeIfAbsent(subjectKey, id -> ConcurrentHashMap.newKeySet()).add(hash(challenge));
     }
 
-    @Override
-    public void resetOcraChallenges(Long userId) {
-        if (userId != null) {
-            usedChallenges.remove(userId);
-        }
+    private static String userKey(Long userId) {
+        return "USER:" + userId;
     }
 
-    @Override
-    public void forgetUser(Long userId) {
-        if (userId != null) {
-            lastTimeSteps.remove(userId);
-            usedChallenges.remove(userId);
-        }
+    private static String tokenKey(Long tokenId) {
+        return "TOKEN:" + tokenId;
     }
 
     @Override

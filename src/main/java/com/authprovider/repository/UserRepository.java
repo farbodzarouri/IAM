@@ -15,10 +15,16 @@ public interface UserRepository extends JpaRepository<User, Long> {
 
     List<User> findAllByUsernameIgnoreCase(String username);
 
+    @Query("select u from User u where u.person.id = :personId")
+    List<User> findByPersonId(@Param("personId") Long personId);
+
+    @Query("select u from User u where u.otpToken.id = :otpTokenId")
+    List<User> findByOtpTokenId(@Param("otpTokenId") Long otpTokenId);
+
     /**
      * Returns the persisted (username, password, secret) of a user as scalar values, independent of any
      * (possibly modified) managed entity instance, so credential changes can be detected on save.
      */
-    @Query("select u.username, u.password, u.secret from User u where u.id = :id")
+    @Query("select u.username, u.password, coalesce(t.secret, u.secret) from User u left join u.otpToken t where u.id = :id")
     List<Object[]> findCredentialSnapshot(@Param("id") Long id);
 }

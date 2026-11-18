@@ -6,14 +6,12 @@
 <body>
 <h1>Edit User</h1>
 
-<form th:action="@{/users/edit/{id}(id=${user.id})}" method="post">
+<form th:action="@{/users/edit/{id}(id=${user.id})}" method="post" autocomplete="off">
     <label>Username:</label>
     <input type="text" name="username" th:value="${user.username}"/>
-    <label>Password:</label>
-    <input type="password" name="password" th:value="${user.password}"/>
-    <!-- Keep the secret as a hidden field if it exists, so it doesn't get lost on save -->
-    <input type="hidden" name="secret" th:value="${user.secret}"/>
-    
+    <label>New Password:</label>
+    <input type="password" name="password" placeholder="Leave blank to keep current password"/>
+
     <button type="submit">Save Changes</button>
 </form>
 

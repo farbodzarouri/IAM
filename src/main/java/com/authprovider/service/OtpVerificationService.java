@@ -1,5 +1,6 @@
 package com.authprovider.service;
 
+import com.authprovider.entity.Admin;
 import com.authprovider.entity.User;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -67,26 +68,141 @@ public class OtpVerificationService {
     }
 
     public Result verifyTotp(User user, int otp) {
-        if (user == null || isBlank(user.getSecret())) {
+        return verifyTotp(user, otp, false);
+    }
+
+    /**
+     * Verifies a TOTP code for a {@link User}. When {@code primaryVerified} is {@code true} (post-password
+     * step-2 verification), OTP failures also count against the shared {@code OtpToken} lockout, blocking
+     * any linked {@link Admin} sharing that token. Unauthenticated channels ({@code primaryVerified=false})
+     * enforce replay protection on the shared token without allowing OTP guessing to lock the admin side.
+     */
+    public Result verifyTotp(User user, int otp, boolean primaryVerified) {
+        if (user == null) {
+            return Result.NOT_ENROLLED;
+        }
+        if (!user.isAccountEnabled()) {
+            return Result.LOCKED;
+        }
+        String secret = user.getSecret();
+        if (isBlank(secret)) {
             return Result.NOT_ENROLLED;
         }
         Long userId = user.getId();
+        Long tokenId = user.getOtpToken() != null ? user.getOtpToken().getId() : null;
+        if (tokenId != null && lockoutService.isTokenLocked(tokenId)) {
+            return Result.LOCKED;
+        }
         if (!lockoutService.tryBeginAttempt(userId)) {
             return Result.LOCKED;
         }
-        OptionalLong step = otp < 0 || totpService == null ? OptionalLong.empty()
-                : totpService.findMatchingTimeStep(user.getSecret(), otp);
-        if (step.isEmpty() && otp >= 0 && totpService != null && totpService.validateOtp(user.getSecret(), otp)) {
-            // TotpService implementations that cannot report the matching step: bind the code to the
-            // current step so that it is still single-use.
-            step = OptionalLong.of(clock.millis() / TIME_STEP_MILLIS);
+        if (primaryVerified && tokenId != null && !lockoutService.tryBeginTokenAttempt(tokenId)) {
+            lockoutService.confirmFailure(userId);
+            return Result.LOCKED;
         }
+        OptionalLong step = matchTimeStep(secret, otp);
         if (step.isEmpty()) {
+            lockoutService.confirmFailure(userId);
+            if (primaryVerified && tokenId != null) {
+                lockoutService.confirmTokenFailure(tokenId);
+            }
+            return Result.INVALID;
+        }
+        boolean consumed = tokenId != null
+                ? usageStore.consumeTokenTimeStep(tokenId, step.getAsLong())
+                : (userId == null || usageStore.consumeTimeStep(userId, step.getAsLong()));
+        if (!consumed) {
+            log.warn("Rejected replayed or out-of-order TOTP for user '{}'", user.getUsername());
+            lockoutService.confirmFailure(userId);
+            if (primaryVerified && tokenId != null) {
+                lockoutService.confirmTokenFailure(tokenId);
+            }
+            return Result.REPLAYED;
+        }
+        lockoutService.recordSuccess(userId);
+        if (primaryVerified && tokenId != null) {
+            lockoutService.recordTokenSuccess(tokenId);
+        }
+        return Result.ACCEPTED;
+    }
+
+    public Result verifyAdminTotp(Admin admin, int otp) {
+        if (admin == null) {
+            return Result.NOT_ENROLLED;
+        }
+        if (!admin.isAccountEnabled()) {
+            return Result.LOCKED;
+        }
+        String secret = admin.getEffectiveSecret();
+        if (isBlank(secret)) {
+            return Result.NOT_ENROLLED;
+        }
+        Long adminId = admin.getId();
+        Long tokenId = admin.getOtpToken() != null ? admin.getOtpToken().getId() : null;
+        if (tokenId != null && lockoutService.isTokenLocked(tokenId)) {
+            return Result.LOCKED;
+        }
+        if (!lockoutService.tryBeginAdminAttempt(adminId)) {
+            return Result.LOCKED;
+        }
+        if (tokenId != null && !lockoutService.tryBeginTokenAttempt(tokenId)) {
+            lockoutService.confirmAdminFailure(adminId, tokenId);
+            return Result.LOCKED;
+        }
+        OptionalLong step = matchTimeStep(secret, otp);
+        if (step.isEmpty()) {
+            lockoutService.confirmAdminFailure(adminId, tokenId);
+            if (tokenId != null) {
+                lockoutService.confirmTokenFailure(tokenId);
+            }
+            return Result.INVALID;
+        }
+        boolean consumed = tokenId == null || usageStore.consumeTokenTimeStep(tokenId, step.getAsLong());
+        if (!consumed) {
+            log.warn("Rejected replayed or out-of-order TOTP for admin '{}'", admin.getUsername());
+            lockoutService.confirmAdminFailure(adminId, tokenId);
+            if (tokenId != null) {
+                lockoutService.confirmTokenFailure(tokenId);
+            }
+            return Result.REPLAYED;
+        }
+        lockoutService.recordAdminSuccess(adminId);
+        if (tokenId != null) {
+            lockoutService.recordTokenSuccess(tokenId);
+        }
+        return Result.ACCEPTED;
+    }
+
+    public Result verifyOcra(User user, String challenge, String response) {
+        if (user == null) {
+            return Result.NOT_ENROLLED;
+        }
+        if (!user.isAccountEnabled()) {
+            return Result.LOCKED;
+        }
+        String secret = user.getSecret();
+        if (isBlank(secret)) {
+            return Result.NOT_ENROLLED;
+        }
+        Long userId = user.getId();
+        Long tokenId = user.getOtpToken() != null ? user.getOtpToken().getId() : null;
+        if (tokenId != null && lockoutService.isTokenLocked(tokenId)) {
+            return Result.LOCKED;
+        }
+        if (!lockoutService.tryBeginAttempt(userId)) {
+            return Result.LOCKED;
+        }
+        boolean valid = challenge != null && response != null && ocraService != null
+                && ocraService.validateOcra(secret, challenge, response);
+        if (!valid) {
             lockoutService.confirmFailure(userId);
             return Result.INVALID;
         }
-        if (userId != null && !usageStore.consumeTimeStep(userId, step.getAsLong())) {
-            log.warn("Rejected replayed or out-of-order TOTP for user '{}'", user.getUsername());
+        boolean consumed = tokenId != null
+                ? usageStore.consumeTokenOcraChallenge(tokenId, challenge)
+                : (userId == null || usageStore.consumeOcraChallenge(userId, challenge));
+        if (!consumed) {
+            log.warn("Rejected replayed OCRA response for user '{}'", user.getUsername());
             lockoutService.confirmFailure(userId);
             return Result.REPLAYED;
         }
@@ -94,27 +210,15 @@ public class OtpVerificationService {
         return Result.ACCEPTED;
     }
 
-    public Result verifyOcra(User user, String challenge, String response) {
-        if (user == null || isBlank(user.getSecret())) {
-            return Result.NOT_ENROLLED;
+    public OptionalLong matchTimeStep(String secret, int otp) {
+        OptionalLong step = otp < 0 || totpService == null ? OptionalLong.empty()
+                : totpService.findMatchingTimeStep(secret, otp);
+        if (step.isEmpty() && otp >= 0 && totpService != null && totpService.validateOtp(secret, otp)) {
+            // TotpService implementations that cannot report the matching step: bind the code to the
+            // current step so that it is still single-use.
+            step = OptionalLong.of(clock.millis() / TIME_STEP_MILLIS);
         }
-        Long userId = user.getId();
-        if (!lockoutService.tryBeginAttempt(userId)) {
-            return Result.LOCKED;
-        }
-        boolean valid = challenge != null && response != null && ocraService != null
-                && ocraService.validateOcra(user.getSecret(), challenge, response);
-        if (!valid) {
-            lockoutService.confirmFailure(userId);
-            return Result.INVALID;
-        }
-        if (userId != null && !usageStore.consumeOcraChallenge(userId, challenge)) {
-            log.warn("Rejected replayed OCRA response for user '{}'", user.getUsername());
-            lockoutService.confirmFailure(userId);
-            return Result.REPLAYED;
-        }
-        lockoutService.recordSuccess(userId);
-        return Result.ACCEPTED;
+        return step;
     }
 
     private static boolean isBlank(String value) {

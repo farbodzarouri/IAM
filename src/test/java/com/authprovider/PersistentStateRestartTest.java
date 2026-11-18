@@ -27,8 +27,8 @@ class PersistentStateRestartTest {
         return new SpringApplicationBuilder(IamApplication.class).run(
                 "--server.port=0",
                 "--radius.enabled=false",
-                "--radius.shared-secret=" + sharedSecret,
-                "--radius.max-failures=2",
+                "--iam.bootstrap.radius.shared-secret=" + sharedSecret,
+                "--iam.bootstrap.policy.max-failures=2",
                 "--spring.datasource.url=jdbc:h2:file:" + dir.resolve("iam").toAbsolutePath() + ";DB_CLOSE_ON_EXIT=FALSE",
                 "--spring.jpa.hibernate.ddl-auto=update");
     }

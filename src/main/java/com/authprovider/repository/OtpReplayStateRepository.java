@@ -13,20 +13,20 @@ import java.time.Instant;
 @Repository
 public interface OtpReplayStateRepository extends JpaRepository<OtpReplayState, Long> {
 
-    boolean existsByUserId(Long userId);
+    boolean existsBySubjectKey(String subjectKey);
 
     /**
-     * Atomically advances the user's last accepted time step; returns 1 only if {@code step} is strictly
+     * Atomically advances the subject's last accepted time step; returns 1 only if {@code step} is strictly
      * greater than the stored value (the row is locked by the database for the duration of the update).
      */
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("update OtpReplayState s set s.lastTimeStep = :step, s.updatedAt = :now "
-            + "where s.userId = :userId and s.lastTimeStep < :step")
-    int advance(@Param("userId") Long userId, @Param("step") long step, @Param("now") Instant now);
+            + "where s.subjectKey = :subjectKey and s.lastTimeStep < :step")
+    int advance(@Param("subjectKey") String subjectKey, @Param("step") long step, @Param("now") Instant now);
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("delete from OtpReplayState s where s.userId = :userId")
-    int deleteByUserId(@Param("userId") Long userId);
+    @Query("delete from OtpReplayState s where s.subjectKey = :subjectKey")
+    int deleteBySubjectKey(@Param("subjectKey") String subjectKey);
 }

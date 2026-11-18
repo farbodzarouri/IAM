@@ -34,7 +34,7 @@ class PrimaryCredentialVerifierTest {
         ldapProperties.setEnabled(true);
         when(userRepository.findByUsername(anyString())).thenReturn(Optional.empty());
         when(userRepository.findAllByUsernameIgnoreCase(anyString())).thenReturn(List.of());
-        verifier = new PrimaryCredentialVerifier(userRepository, new RadiusProperties(), ldapProperties, directory);
+        verifier = new PrimaryCredentialVerifier(userRepository, ldapProperties, directory);
     }
 
     private void localUser(User user) {

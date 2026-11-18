@@ -1,7 +1,11 @@
 package com.authprovider.radius;
 
+import com.authprovider.config.RadiusProperties;
+import com.authprovider.entity.SecurityPolicy;
 import com.authprovider.entity.User;
+import com.authprovider.repository.RadiusClientRepository;
 import com.authprovider.repository.UserRepository;
+import com.authprovider.service.SecurityPolicyService;
 import com.authprovider.service.TotpService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -13,8 +17,8 @@ import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest(properties = {
         "radius.port=0",
         "radius.bind-address=127.0.0.1",
-        "radius.shared-secret=integration-secret",
-        "radius.challenge.ttl-seconds=45"
+        "iam.bootstrap.radius.shared-secret=integration-secret",
+        "iam.bootstrap.policy.challenge-ttl-seconds=45"
 })
 class RadiusIntegrationTest {
 
@@ -25,16 +29,25 @@ class RadiusIntegrationTest {
     private RadiusProperties radiusProperties;
 
     @Autowired
+    private SecurityPolicyService policyService;
+
+    @Autowired
+    private RadiusClientRepository clientRepository;
+
+    @Autowired
     private UserRepository userRepository;
 
     @Autowired
     private TotpService totpService;
 
     @Test
-    void propertiesAreBoundFromConfiguration() {
-        assertEquals("integration-secret", radiusProperties.getSharedSecret());
-        assertEquals(45, radiusProperties.getChallenge().getTtlSeconds());
+    void propertiesAndSeededDatabaseConfigAreBoundCleanly() {
+        assertEquals("127.0.0.1", radiusProperties.getBindAddress());
         assertTrue(radiusServer.isRunning());
+        SecurityPolicy policy = policyService.current();
+        assertEquals(45, policy.getChallengeTtlSeconds());
+        assertTrue(clientRepository.findAll().stream()
+                .anyMatch(c -> "integration-secret".equals(c.getSharedSecret()) && c.isActive()));
     }
 
     @Test

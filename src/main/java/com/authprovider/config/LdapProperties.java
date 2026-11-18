@@ -16,8 +16,8 @@ public class LdapProperties {
     private String realm;
     /** Evaluation order of this directory when federated (lower first). */
     private int priority = 100;
-    private String url = "ldap://localhost:389";
-    private String baseDn = "dc=example,dc=org";
+    private String url;
+    private String baseDn;
     private String userSearchFilter = "(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))";
     private String userDnPattern;
     private String bindDn;
