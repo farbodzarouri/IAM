@@ -77,16 +77,16 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 @SpringBootTest(properties = {
         "radius.port=0",
         "radius.bind-address=127.0.0.1",
-        "iam.bootstrap.radius.shared-secret=oauth-grader-radius",
-        "iam.bootstrap.admin.username=grader-boot-admin",
-        "iam.bootstrap.admin.password=GraderBootAdm!123",
+        "iam.bootstrap.radius.shared-secret=oauth-security-radius",
+        "iam.bootstrap.admin.username=oauth-boot-admin",
+        "iam.bootstrap.admin.password=OAuthBootAdm!123",
         "iam.bootstrap.policy.max-failures=3",
         "iam.bootstrap.policy.lockout-seconds=120",
         "iam.bootstrap.policy.mfa-approval-ttl-seconds=60",
         "iam.bootstrap.policy.challenge-ttl-seconds=60"
 })
 @AutoConfigureMockMvc
-class OAuth2ClientSecurityGraderTest {
+class OAuth2ClientSecurityIntegrationTest {
 
     private static final String USER_PASS = "Str0ng!UserPass9";
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -194,7 +194,7 @@ class OAuth2ClientSecurityGraderTest {
     }
 
     private static RequestPostProcessor adminUser() {
-        return SecurityMockMvcRequestPostProcessors.user("grader-boot-admin").roles("ADMIN");
+        return SecurityMockMvcRequestPostProcessors.user("oauth-boot-admin").roles("ADMIN");
     }
 
     private User createUser(String username, String password, String secret, AuthMode authMode) {
@@ -649,7 +649,7 @@ class OAuth2ClientSecurityGraderTest {
                 "--spring.jmx.enabled=false",
                 "--radius.enabled=false",
                 "--iam.bootstrap.radius.shared-secret=cluster-oauth-secret",
-                "--iam.bootstrap.admin.username=grader-boot-admin",
+                "--iam.bootstrap.admin.username=oauth-boot-admin",
                 "--iam.bootstrap.admin.password=ClusterAdmin!123",
                 "--iam.bootstrap.policy.max-failures=2",
                 "--iam.bootstrap.policy.lockout-seconds=120",
@@ -748,7 +748,7 @@ class OAuth2ClientSecurityGraderTest {
 
         MvcResult adminLogin = mockMvc.perform(post("/v1/api/admin/auth/login")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"username\":\"grader-boot-admin\",\"password\":\"GraderBootAdm!123\"}"))
+                        .content("{\"username\":\"oauth-boot-admin\",\"password\":\"OAuthBootAdm!123\"}"))
                 .andReturn();
         String adminBody = adminLogin.getResponse().getContentAsString();
         assertFalse(adminBody.isBlank(), "/v1/api/admin/auth/login must reach AdminAuthController without Bearer auth");
