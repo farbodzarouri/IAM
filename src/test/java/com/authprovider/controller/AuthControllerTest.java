@@ -1,5 +1,6 @@
 package com.authprovider.controller;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.entity.User;
 import com.authprovider.ldap.DirectoryAuthenticationResult;
 import com.authprovider.ldap.DirectoryAuthenticator;
@@ -76,7 +77,7 @@ public class AuthControllerTest {
             json.append(",\"otp\":\"").append(otp).append("\"");
         }
         json.append("}");
-        return mockMvc.perform(post("/v1/api/auth/login")
+        return mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(json.toString()));
     }
@@ -185,10 +186,10 @@ public class AuthControllerTest {
 
     @Test
     void invalidPayloadsAreRejected() throws Exception {
-        mockMvc.perform(post("/v1/api/auth/login").contentType(MediaType.APPLICATION_JSON).content("{bad"))
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer()).contentType(MediaType.APPLICATION_JSON).content("{bad"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.status").value("INVALID_REQUEST"));
-        mockMvc.perform(post("/v1/api/auth/login").contentType(MediaType.APPLICATION_JSON).content("{\"username\":\"alice\"}"))
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer()).contentType(MediaType.APPLICATION_JSON).content("{\"username\":\"alice\"}"))
                 .andExpect(status().isBadRequest());
         login("alice", "", null).andExpect(status().isBadRequest());
         login(" ", "correct", null).andExpect(status().isBadRequest());

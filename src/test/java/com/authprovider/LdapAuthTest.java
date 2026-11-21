@@ -1,5 +1,6 @@
 package com.authprovider;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.entity.User;
 import com.authprovider.repository.UserRepository;
 import com.authprovider.service.TotpService;
@@ -111,7 +112,7 @@ public class LdapAuthTest {
                 "password", "Password123!"
         );
 
-        MvcResult result = mockMvc.perform(post("/v1/api/auth/login")
+        MvcResult result = mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk())
@@ -162,7 +163,7 @@ public class LdapAuthTest {
                 "otp", otpStr
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk());
@@ -184,7 +185,7 @@ public class LdapAuthTest {
                 "otp", otpStr
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -208,7 +209,7 @@ public class LdapAuthTest {
                 "otp", invalidOtpStr
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -224,7 +225,7 @@ public class LdapAuthTest {
         request.put("username", "alice");
         request.put("password", "");
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(result -> {
@@ -246,7 +247,7 @@ public class LdapAuthTest {
                 "password", "Password123!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -272,7 +273,7 @@ public class LdapAuthTest {
                 "password", "LocalAdminSecretPass!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -297,7 +298,7 @@ public class LdapAuthTest {
                     "password", "Password123!",
                     "otp", otpStr
             );
-            mockMvc.perform(post("/v1/api/auth/login")
+            mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                             .contentType(MediaType.APPLICATION_JSON)
                             .content(objectMapper.writeValueAsString(request)))
                     .andExpect(status().isOk());
@@ -322,12 +323,12 @@ public class LdapAuthTest {
                 "password", "Password123!",
                 "otp", otpStr
         );
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk());
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -347,7 +348,7 @@ public class LdapAuthTest {
                 "password", "Password123!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -362,7 +363,7 @@ public class LdapAuthTest {
                 "otp", "123456"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -376,12 +377,12 @@ public class LdapAuthTest {
                 "password", "Password123!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(blankUserRequest)))
                 .andExpect(status().is4xxClientError());
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().is4xxClientError());
@@ -397,7 +398,7 @@ public class LdapAuthTest {
                 "password", "Password123!"
         );
 
-        MvcResult result = mockMvc.perform(post("/v1/api/auth/login")
+        MvcResult result = mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk())

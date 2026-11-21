@@ -1,5 +1,6 @@
 package com.authprovider.controller;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.entity.User;
 import com.authprovider.service.UserService;
 import org.junit.jupiter.api.Test;
@@ -62,7 +63,7 @@ public class OtpControllerTest {
 
         String json = "{\"username\": \"testuser\", \"otp\": \"123456\"}";
 
-        mockMvc.perform(post("/v1/api/otp/validate")
+        mockMvc.perform(post("/v1/api/otp/validate").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(json))
                 .andExpect(status().isForbidden())
@@ -72,7 +73,7 @@ public class OtpControllerTest {
 
     @Test
     public void testValidateOtp_InvalidPayload() throws Exception {
-        mockMvc.perform(post("/v1/api/otp/validate")
+        mockMvc.perform(post("/v1/api/otp/validate").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\": \"testuser\", \"otp\": \"not-digits\"}"))
                 .andExpect(status().isBadRequest())

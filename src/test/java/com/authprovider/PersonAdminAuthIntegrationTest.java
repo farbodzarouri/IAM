@@ -1,5 +1,6 @@
 package com.authprovider;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.config.DatabaseConfigurationBootstrap;
 import com.authprovider.entity.Admin;
 import com.authprovider.entity.LdapDirectory;
@@ -226,7 +227,7 @@ class PersonAdminAuthIntegrationTest {
             sb.append(",\"otp\":\"").append(escapeJson(otp)).append("\"");
         }
         sb.append("}");
-        MvcResult res = mockMvc.perform(post(endpoint)
+        MvcResult res = mockMvc.perform(post(endpoint).with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(sb.toString()))
                 .andReturn();
@@ -235,7 +236,7 @@ class PersonAdminAuthIntegrationTest {
 
     private boolean postMfaPreAuth(String username, int otp) throws Exception {
         String body = "{\"username\":\"" + escapeJson(username) + "\",\"otp\":" + otp + "}";
-        String resp = mockMvc.perform(post("/v1/api/mfa/preauth")
+        String resp = mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isOk())
@@ -245,7 +246,7 @@ class PersonAdminAuthIntegrationTest {
 
     private boolean postValidateOtp(String username, String otp) throws Exception {
         String body = "{\"username\":\"" + escapeJson(username) + "\",\"otp\":\"" + escapeJson(otp) + "\"}";
-        MvcResult res = mockMvc.perform(post("/v1/api/otp/validate")
+        MvcResult res = mockMvc.perform(post("/v1/api/otp/validate").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andReturn();

@@ -30,7 +30,17 @@ public class AuthAuditLog {
         MFA_PREAUTH,
         RADIUS,
         ADMIN_LOGIN,
-        OTP_VALIDATION
+        OTP_VALIDATION,
+        /** RFC 6749 token endpoint (client authentication and token issuance). */
+        OAUTH2_TOKEN,
+        /** RFC 7662 token introspection endpoint. */
+        OAUTH2_INTROSPECTION,
+        /** RFC 7009 token revocation endpoint. */
+        OAUTH2_REVOCATION,
+        /** RFC 6750 bearer token rejected by a protected endpoint. */
+        OAUTH2_BEARER,
+        /** Administrative changes to registered OAuth 2.0 clients. */
+        OAUTH2_CLIENT_ADMIN
     }
 
     public enum Outcome {
@@ -62,7 +72,7 @@ public class AuthAuditLog {
     @Column(name = "client_address", length = 64, updatable = false)
     private String clientAddress;
 
-    /** Name of the RADIUS client or LDAP directory involved, if any. */
+    /** Name of the RADIUS client, OAuth 2.0 client id, or LDAP directory involved, if any. */
     @Column(name = "client_name", length = 128, updatable = false)
     private String clientName;
 

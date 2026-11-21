@@ -1,5 +1,6 @@
 package com.authprovider.radius;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.entity.User;
 import com.authprovider.repository.UserRepository;
 import com.authprovider.service.TotpServiceImpl;
@@ -59,7 +60,7 @@ class RadiusServerIntegrationTest {
     }
 
     private void preauth(String username) throws Exception {
-        mockMvc.perform(post("/v1/api/mfa/preauth").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON)
                         .content(preauthJson(username, totp.generateOtp(user.getSecret()))))
                 .andExpect(status().isOk()).andExpect(content().string("true"));
     }
@@ -181,19 +182,19 @@ class RadiusServerIntegrationTest {
     @Test
     void otpCannotBeReused() throws Exception {
         int otp = totp.generateOtp(user.getSecret());
-        mockMvc.perform(post("/v1/api/mfa/preauth").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON)
                 .content(preauthJson(user.getUsername(), otp))).andExpect(content().string("true"));
-        mockMvc.perform(post("/v1/api/mfa/preauth").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON)
                 .content(preauthJson(user.getUsername(), otp))).andExpect(content().string("false"));
     }
 
     @Test
     void preauthValidation() throws Exception {
-        mockMvc.perform(post("/v1/api/mfa/preauth").contentType(MediaType.APPLICATION_JSON).content("{}"))
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isBadRequest()).andExpect(content().string("false"));
-        mockMvc.perform(post("/v1/api/mfa/preauth").contentType(MediaType.APPLICATION_JSON).content("not json"))
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON).content("not json"))
                 .andExpect(status().isBadRequest());
-        mockMvc.perform(post("/v1/api/mfa/preauth").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON)
                         .content(preauthJson("nobody-here", 123456)))
                 .andExpect(status().isOk()).andExpect(content().string("false"));
     }

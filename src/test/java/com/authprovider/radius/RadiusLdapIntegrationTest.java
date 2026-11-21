@@ -1,5 +1,6 @@
 package com.authprovider.radius;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.LdapAuthTest;
 import com.authprovider.entity.User;
 import com.authprovider.repository.UserRepository;
@@ -132,7 +133,7 @@ class RadiusLdapIntegrationTest {
     void outOfBandPreAuthenticationStillWorksWithDirectoryEnabled() throws Exception {
         userRepository.save(User.builder().username("alice").secret(TOTP_SECRET).build());
 
-        mockMvc.perform(post("/v1/api/mfa/preauth").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"alice\",\"otp\":" + totpService.generateOtp(TOTP_SECRET) + "}"))
                 .andExpect(status().isOk()).andExpect(content().string("true"));
 
@@ -144,7 +145,7 @@ class RadiusLdapIntegrationTest {
 
     @Test
     void webLoginEnrollmentEnablesRadiusForDirectoryUser() throws Exception {
-        mockMvc.perform(post("/v1/api/auth/login").contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer()).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"alice\",\"password\":\"Password123!\"}"))
                 .andExpect(status().isOk());
         String secret = userRepository.findByUsername("alice").orElseThrow().getSecret();

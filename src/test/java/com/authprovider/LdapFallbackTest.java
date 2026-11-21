@@ -1,5 +1,6 @@
 package com.authprovider;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.entity.User;
 import com.authprovider.repository.UserRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -67,7 +68,7 @@ public class LdapFallbackTest {
                 "password", "WorkerLocalPass123!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk());
@@ -87,7 +88,7 @@ public class LdapFallbackTest {
                 "password", "OldBobLocalPass!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -107,7 +108,7 @@ public class LdapFallbackTest {
                 "password", "WrongLocalPassword999!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());
@@ -121,7 +122,7 @@ public class LdapFallbackTest {
                 "password", "Password123!"
         );
 
-        mockMvc.perform(post("/v1/api/auth/login")
+        mockMvc.perform(post("/v1/api/auth/login").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isUnauthorized());

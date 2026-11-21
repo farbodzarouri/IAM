@@ -2,6 +2,8 @@ package com.authprovider.controller;
 
 import com.authprovider.dto.LoginRequest;
 import com.authprovider.dto.LoginResponse;
+import com.authprovider.entity.AuthMode;
+import com.authprovider.oauth2.OAuthClientAuthentication;
 import com.authprovider.service.LoginService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,7 +27,10 @@ public class AuthController {
 
     @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<LoginResponse> login(@RequestBody(required = false) LoginRequest request) {
-        return respond(loginService.login(request));
+        AuthMode clientAuthMode = OAuthClientAuthentication.current()
+                .map(OAuthClientAuthentication.Client::authMode)
+                .orElse(null);
+        return respond(loginService.login(request, clientAuthMode));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)

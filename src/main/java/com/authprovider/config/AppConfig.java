@@ -11,7 +11,8 @@ import java.security.SecureRandom;
 import java.time.Clock;
 
 @Configuration
-@EnableConfigurationProperties({RadiusProperties.class, LdapProperties.class, BootstrapProperties.class})
+@EnableConfigurationProperties({RadiusProperties.class, LdapProperties.class, BootstrapProperties.class,
+        OAuth2Properties.class})
 public class AppConfig {
 
     @Bean

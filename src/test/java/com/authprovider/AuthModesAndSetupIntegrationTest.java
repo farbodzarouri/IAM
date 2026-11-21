@@ -1,5 +1,6 @@
 package com.authprovider;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.config.DatabaseConfigurationBootstrap;
 import com.authprovider.entity.Admin;
 import com.authprovider.entity.AuthAuditLog;
@@ -221,7 +222,7 @@ class AuthModesAndSetupIntegrationTest {
             sb.append(",\"otp\":\"").append(escapeJson(otp)).append("\"");
         }
         sb.append("}");
-        MvcResult res = mockMvc.perform(post(endpoint)
+        MvcResult res = mockMvc.perform(post(endpoint).with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(sb.toString()))
                 .andReturn();
@@ -532,7 +533,7 @@ class AuthModesAndSetupIntegrationTest {
 
         // Username-based /v1/api/otp/validate & /validate-ocra return structured status & write OTP_VALIDATION audit log
         String otpPlus1 = otpForStep(secret, step + 1);
-        MvcResult validRes = mockMvc.perform(post("/v1/api/otp/validate")
+        MvcResult validRes = mockMvc.perform(post("/v1/api/otp/validate").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"CORP\\\\rest-otp-only\",\"otp\":\"" + otpPlus1 + "\"}"))
                 .andExpect(status().isOk())
@@ -544,7 +545,7 @@ class AuthModesAndSetupIntegrationTest {
 
         String challenge = "24681357";
         String ocra = ocraService.generateOcra(secret, challenge);
-        mockMvc.perform(post("/v1/api/otp/validate-ocra")
+        mockMvc.perform(post("/v1/api/otp/validate-ocra").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"rest-otp-only\",\"challenge\":\"" + challenge + "\",\"otp\":\"" + ocra + "\"}"))
                 .andExpect(status().isOk())
@@ -554,14 +555,14 @@ class AuthModesAndSetupIntegrationTest {
         // Wrong OTP validation locks only User, leaving Admin accessible
         String wrong = wrongOtpForStep(secret, step);
         for (int i = 0; i < 3; i++) {
-            mockMvc.perform(post("/v1/api/otp/validate")
+            mockMvc.perform(post("/v1/api/otp/validate").with(bearer())
                             .contentType(MediaType.APPLICATION_JSON)
                             .content("{\"username\":\"rest-otp-only\",\"otp\":\"" + wrong + "\"}"))
                     .andExpect(status().isUnauthorized())
                     .andExpect(jsonPath("$.valid").value(false))
                     .andExpect(jsonPath("$.status").value("INVALID_OTP"));
         }
-        mockMvc.perform(post("/v1/api/otp/validate")
+        mockMvc.perform(post("/v1/api/otp/validate").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"rest-otp-only\",\"otp\":\"" + otpPlus1 + "\"}"))
                 .andExpect(status().isForbidden())

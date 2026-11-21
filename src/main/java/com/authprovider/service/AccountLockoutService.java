@@ -10,6 +10,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.LongConsumer;
 
@@ -34,6 +35,7 @@ public class AccountLockoutService {
     public static final String SCOPE = AuthFailureRecord.SCOPE_ACCOUNT;
     public static final String SCOPE_ADMIN = AuthFailureRecord.SCOPE_ADMIN;
     public static final String SCOPE_OTP_TOKEN = AuthFailureRecord.SCOPE_OTP_TOKEN;
+    public static final String SCOPE_OAUTH_CLIENT = AuthFailureRecord.SCOPE_OAUTH_CLIENT;
 
     private final SecurityPolicyService policyService;
     private final AuthFailureStore failureStore;
@@ -93,6 +95,22 @@ public class AccountLockoutService {
         return tokenId != null && isLocked(SCOPE_OTP_TOKEN, key(tokenId));
     }
 
+    /** Whether OAuth 2.0 client authentication of the given {@code clients.id} is locked out. */
+    public boolean isClientLocked(Long clientId) {
+        return clientId != null && isLocked(SCOPE_OAUTH_CLIENT, key(clientId));
+    }
+
+    /** Lockout expiry of an OAuth 2.0 client, if currently locked out by a lockout period. */
+    public Optional<Instant> clientLockedUntil(Long clientId) {
+        if (clientId == null) {
+            return Optional.empty();
+        }
+        Instant now = clock.instant();
+        return failureStore.get(SCOPE_OAUTH_CLIENT, key(clientId))
+                .map(AuthFailureStore.FailureState::lockedUntil)
+                .filter(now::isBefore);
+    }
+
     /**
      * Atomically reserves one authentication attempt. Returns {@code false} (without changing state) if
      * the account is locked or the threshold is already exhausted by failed / in-flight attempts. A
@@ -108,6 +126,35 @@ public class AccountLockoutService {
 
     public boolean tryBeginTokenAttempt(Long tokenId) {
         return tokenId == null || tryBeginAttempt(SCOPE_OTP_TOKEN, key(tokenId));
+    }
+
+    /**
+     * Reserves one OAuth 2.0 client secret verification (see {@link #tryBeginAttempt(Long)}); must be
+     * followed by {@link #confirmClientFailure} or {@link #recordClientSuccess}.
+     */
+    public boolean tryBeginClientAttempt(Long clientId) {
+        return clientId != null && tryBeginAttempt(SCOPE_OAUTH_CLIENT, key(clientId));
+    }
+
+    /** Confirms a reserved client authentication failure; returns {@code true} if the client became locked. */
+    public boolean confirmClientFailure(Long clientId) {
+        if (clientId == null) {
+            return false;
+        }
+        boolean[] locked = {false};
+        applyFailure(SCOPE_OAUTH_CLIENT, key(clientId), false, () -> locked[0] = true);
+        return locked[0];
+    }
+
+    public void recordClientSuccess(Long clientId) {
+        if (clientId != null) {
+            failureStore.delete(SCOPE_OAUTH_CLIENT, key(clientId));
+        }
+    }
+
+    /** Administrative unblock: clears failure counters and any active lockout of the client. */
+    public void clearClientLockout(Long clientId) {
+        recordClientSuccess(clientId);
     }
 
     /** Confirms that a reserved attempt failed, locking the account when the threshold is reached. */
@@ -225,6 +272,7 @@ public class AccountLockoutService {
         failureStore.purgeExpired(SCOPE, cutoff, now);
         failureStore.purgeExpired(SCOPE_ADMIN, cutoff, now);
         failureStore.purgeExpired(SCOPE_OTP_TOKEN, cutoff, now);
+        failureStore.purgeExpired(SCOPE_OAUTH_CLIENT, cutoff, now);
     }
 
     private boolean isLocked(String scope, String subjectKey) {

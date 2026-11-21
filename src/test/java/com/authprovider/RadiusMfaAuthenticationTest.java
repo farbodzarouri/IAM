@@ -1,5 +1,6 @@
 package com.authprovider;
 
+import static com.authprovider.OAuthTestSupport.bearer;
 import com.authprovider.entity.User;
 import com.authprovider.repository.UserRepository;
 import com.authprovider.service.SecretGenerator;
@@ -77,7 +78,7 @@ public class RadiusMfaAuthenticationTest {
         User alice = createUserWithSecret("alice");
         int otp = totpService.generateOtp(alice.getSecret());
 
-        mockMvc.perform(post("/v1/api/mfa/preauth")
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"alice\",\"otp\":" + otp + "}"))
                 .andExpect(status().isOk())
@@ -115,14 +116,14 @@ public class RadiusMfaAuthenticationTest {
         User user = createUserWithSecret("replayuser");
         int otp = totpService.generateOtp(user.getSecret());
 
-        mockMvc.perform(post("/v1/api/mfa/preauth")
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"replayuser\",\"otp\":" + otp + "}"))
                 .andExpect(status().isOk())
                 .andExpect(content().string("true"));
 
         // Reusing the exact same 6-digit TOTP code for the same user in the same window must fail
-        MvcResult replayResult = mockMvc.perform(post("/v1/api/mfa/preauth")
+        MvcResult replayResult = mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"replayuser\",\"otp\":" + otp + "}"))
                 .andReturn();
@@ -139,7 +140,7 @@ public class RadiusMfaAuthenticationTest {
         int otp = totpService.generateOtp(bob.getSecret());
 
         // Pre-authenticate using NetBIOS DOMAIN\\username format
-        mockMvc.perform(post("/v1/api/mfa/preauth")
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"CONTOSO\\\\bob\",\"otp\":" + otp + "}"))
                 .andExpect(status().isOk())
@@ -161,7 +162,7 @@ public class RadiusMfaAuthenticationTest {
         User charlie = createUserWithSecret("charlie");
         int otp = totpService.generateOtp(charlie.getSecret());
 
-        mockMvc.perform(post("/v1/api/mfa/preauth")
+        mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"charlie\",\"otp\":" + otp + "}"))
                 .andExpect(status().isOk())

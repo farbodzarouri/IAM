@@ -90,7 +90,12 @@ public class LoginServiceImpl implements LoginService {
 
     @Override
     public LoginResponse login(LoginRequest request) {
-        Outcome outcome = doLogin(request);
+        return login(request, null);
+    }
+
+    @Override
+    public LoginResponse login(LoginRequest request, AuthMode clientAuthMode) {
+        Outcome outcome = doLogin(request, clientAuthMode);
         audit(request, outcome);
         return outcome.response();
     }
@@ -123,7 +128,7 @@ public class LoginServiceImpl implements LoginService {
                 .log();
     }
 
-    private Outcome doLogin(LoginRequest request) {
+    private Outcome doLogin(LoginRequest request, AuthMode clientMode) {
         if (request == null) {
             return result(failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required"));
         }
@@ -134,11 +139,11 @@ public class LoginServiceImpl implements LoginService {
         }
         if (password == null || password.isEmpty()) {
             AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, isStripRealm());
-            if (resolution.isFound() && effectiveAuthMode(resolution.user()) == AuthMode.OTP_ONLY) {
+            if (resolution.isFound() && effectiveAuthMode(resolution.user(), clientMode) == AuthMode.OTP_ONLY) {
                 return authenticateOtpOnly(resolution.user(), request.getOtp());
             }
             if (!resolution.isFound() && resolution.status() != AccountResolver.Status.AMBIGUOUS
-                    && policyDefaultAuthMode() == AuthMode.OTP_ONLY) {
+                    && baseAuthMode(clientMode) == AuthMode.OTP_ONLY) {
                 return result(invalidCredentials());
             }
             if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
@@ -148,19 +153,19 @@ public class LoginServiceImpl implements LoginService {
         }
 
         if (directoryAuthenticator == null || !directoryConfiguration.isEnabled()) {
-            return authenticateLocal(username, password, request.getOtp());
+            return authenticateLocal(username, password, request.getOtp(), clientMode);
         }
-        return authenticateWithDirectory(username, password, request.getOtp());
+        return authenticateWithDirectory(username, password, request.getOtp(), clientMode);
     }
 
-    private Outcome authenticateWithDirectory(String username, String password, String otp) {
+    private Outcome authenticateWithDirectory(String username, String password, String otp, AuthMode clientMode) {
         // Lockouts are enforced before the directory bind so that a locked account cannot be used to
         // probe (or lock out) the directory account.
         User lockSubject = lockoutSubjectResolver.resolve(username, isStripRealm()).user();
         if (isBlocked(lockSubject)) {
             return locked(lockSubject);
         }
-        AuthMode preMode = effectiveAuthMode(lockSubject);
+        AuthMode preMode = effectiveAuthMode(lockSubject, clientMode);
         if (preMode == AuthMode.OTP_ONLY) {
             return authenticateOtpOnly(lockSubject, otp);
         }
@@ -193,10 +198,11 @@ public class LoginServiceImpl implements LoginService {
             case AUTHENTICATED:
                 String canonical = result.username() != null && !result.username().isBlank()
                         ? result.username() : username;
-                return completeDirectoryLogin(canonical, effectiveOtp, directoryConfiguration.isAutoProvision(result));
+                return completeDirectoryLogin(canonical, effectiveOtp, directoryConfiguration.isAutoProvision(result),
+                        clientMode);
             case USER_NOT_FOUND:
                 if (directoryConfiguration.isFallbackToLocal(username)) {
-                    return authenticateLocal(username, password, otp);
+                    return authenticateLocal(username, password, otp, clientMode);
                 }
                 return result(invalidCredentials());
             case UNAVAILABLE:
@@ -210,7 +216,7 @@ public class LoginServiceImpl implements LoginService {
         }
     }
 
-    private Outcome completeDirectoryLogin(String username, String otp, boolean autoProvision) {
+    private Outcome completeDirectoryLogin(String username, String otp, boolean autoProvision, AuthMode clientMode) {
         User user;
         synchronized (provisioningLock) {
             // The directory's canonical name is authoritative: it is linked as is (no realm stripping),
@@ -225,7 +231,7 @@ public class LoginServiceImpl implements LoginService {
                     return result(failure(LoginResponse.Status.NOT_PROVISIONED, "Account is not provisioned"));
                 }
                 log.info("Provisioning local account for directory user {}", username);
-                if (policyDefaultAuthMode() == AuthMode.PASSWORD_ONLY) {
+                if (baseAuthMode(clientMode) == AuthMode.PASSWORD_ONLY) {
                     User created = provisionWithoutSecret(username);
                     if (created != null) {
                         lockoutService.recordSuccess(created.getId());
@@ -252,7 +258,7 @@ public class LoginServiceImpl implements LoginService {
         if (isBlocked(user)) {
             return locked(user);
         }
-        AuthMode mode = effectiveAuthMode(user);
+        AuthMode mode = effectiveAuthMode(user, clientMode);
         if (mode == AuthMode.PASSWORD_ONLY) {
             lockoutService.recordSuccess(user.getId());
             return authenticatedOutcome(user, SOURCE_DIRECTORY);
@@ -272,7 +278,7 @@ public class LoginServiceImpl implements LoginService {
         }
     }
 
-    private Outcome authenticateLocal(String username, String password, String otp) {
+    private Outcome authenticateLocal(String username, String password, String otp, AuthMode clientMode) {
         AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, isStripRealm());
         if (!resolution.isFound()) {
             if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
@@ -286,7 +292,7 @@ public class LoginServiceImpl implements LoginService {
             passwordService.simulateCheck(password);
             return locked(user);
         }
-        AuthMode mode = effectiveAuthMode(user);
+        AuthMode mode = effectiveAuthMode(user, clientMode);
         if (mode == AuthMode.OTP_ONLY) {
             return authenticateOtpOnly(user, otp);
         }
@@ -385,8 +391,24 @@ public class LoginServiceImpl implements LoginService {
         return authenticatedOutcome(user, source);
     }
 
-    private AuthMode effectiveAuthMode(User user) {
-        return user != null && user.getAuthMode() != null ? user.getAuthMode() : policyDefaultAuthMode();
+    /**
+     * Resolves the effective mode like RADIUS clients: an account override wins over the calling OAuth 2.0
+     * client's override, which wins over the policy default. A strict {@code PASSWORD_AND_OTP} account may
+     * still submit its OTP inline when the client requires {@code PASSWORD_AND_OTP_INLINE}.
+     */
+    private AuthMode effectiveAuthMode(User user, AuthMode clientMode) {
+        AuthMode base = baseAuthMode(clientMode);
+        if (user != null && user.getAuthMode() != null) {
+            if (user.getAuthMode() == AuthMode.PASSWORD_AND_OTP && clientMode == AuthMode.PASSWORD_AND_OTP_INLINE) {
+                return AuthMode.PASSWORD_AND_OTP_INLINE;
+            }
+            return user.getAuthMode();
+        }
+        return base;
+    }
+
+    private AuthMode baseAuthMode(AuthMode clientMode) {
+        return clientMode != null ? clientMode : policyDefaultAuthMode();
     }
 
     private AuthMode policyDefaultAuthMode() {

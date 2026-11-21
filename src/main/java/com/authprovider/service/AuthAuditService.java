@@ -1,12 +1,16 @@
 package com.authprovider.service;
 
 import com.authprovider.entity.AuthAuditLog;
+import com.authprovider.oauth2.OAuthClientAuthentication;
 import com.authprovider.repository.AuthAuditLogRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 
 import java.time.Clock;
+import java.util.Optional;
 
 /**
  * Records authentication attempts, outcomes and failure reasons in the append-only
@@ -46,6 +50,14 @@ public class AuthAuditService {
         if (repository == null) {
             return;
         }
+        if (clientName == null && clientAddress == null) {
+            // REST calls made by a connected system: record the authenticated OAuth 2.0 client and its address.
+            Optional<OAuthClientAuthentication.Client> caller = currentOAuthClient();
+            if (caller.isPresent()) {
+                clientName = caller.get().clientId();
+                clientAddress = currentRemoteAddress();
+            }
+        }
         try {
             repository.save(AuthAuditLog.builder()
                     .occurredAt(clock.instant())
@@ -61,6 +73,21 @@ public class AuthAuditService {
         } catch (RuntimeException e) {
             log.error("Failed to write authentication audit record ({} {} {})", channel, outcome, reason, e);
         }
+    }
+
+    private static Optional<OAuthClientAuthentication.Client> currentOAuthClient() {
+        try {
+            return OAuthClientAuthentication.current();
+        } catch (RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    private static String currentRemoteAddress() {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes) {
+            return attributes.getRequest().getRemoteAddr();
+        }
+        return null;
     }
 
     private static String truncate(String value, int max) {

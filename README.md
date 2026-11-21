@@ -1,6 +1,6 @@
 # Identity & Access Management (IAM) Provider
 
-A modular identity, access management, and multi-factor authentication (MFA) service built with Spring Boot 3.2 (Java 21) and standard Java SE cryptography. The platform models natural identities (`Person`), hardware/software second-factor tokens (`OtpToken`), separated regular vs. administrative principals (`User` and `Admin`), local BCrypt and federated LDAP / Active Directory authentication, time-based OTP (`RFC 6238` TOTP), challenge-response (`RFC 6287` OCRA), and an embedded `RFC 2865` / `RFC 3579` RADIUS server for VPN and Remote Desktop Gateway (RDG) authentication.
+A modular identity, access management, and multi-factor authentication (MFA) service built with Spring Boot 3.2 (Java 21) and standard Java SE cryptography. The platform models natural identities (`Person`), hardware/software second-factor tokens (`OtpToken`), separated regular vs. administrative principals (`User` and `Admin`), local BCrypt and federated LDAP / Active Directory authentication, time-based OTP (`RFC 6238` TOTP), challenge-response (`RFC 6287` OCRA), an embedded `RFC 2865` / `RFC 3579` RADIUS server for VPN and Remote Desktop Gateway (RDG) authentication, and an OAuth 2.0 machine-to-machine authorization server (`RFC 6749` client credentials, `RFC 9068` RS256 JWT access tokens) protecting the connected-system APIs.
 
 ---
 
@@ -18,6 +18,9 @@ A modular identity, access management, and multi-factor authentication (MFA) ser
   - RFC 6238 TOTP with clock-drift window matching, RFC 6287 OCRA constant-time challenge-response, and `otpauth://` QR provisioning (`OtpProvisioningSupport`).
 - **Embedded Enterprise RADIUS Server**:
   - RFC 2865 / RFC 3579 UDP authentication server (`RadiusServer`, `RadiusAuthenticationHandler`) supporting Out-of-Band RDG pre-authentication, In-Band `Access-Challenge` (`State`), Inline `<password><6-digit-otp>`, `OTP_ONLY`, `PASSWORD_ONLY`, and `Status-Server` health checks.
+- **OAuth 2.0 Machine-to-Machine Client Authentication**:
+  - Connected systems authenticate with scoped `Authorization: Bearer` access tokens (RFC 6750) before calling `/v1/api/auth/login`, `/v1/api/otp/validate`, `/v1/api/otp/validate-ocra`, and `/v1/api/mfa/preauth`.
+  - `client_credentials` token endpoint, RFC 7662 introspection, RFC 7009 revocation, and a public RFC 7517 JWK Set, implemented with standard Java SE cryptography only.
 - **Day-0 Setup & Database-Managed Runtime Configuration**:
   - Interactive first-run `/setup` wizard and `/v1/api/setup/**` endpoints active only before initial `Admin` creation or Admin LDAP setup, locking permanently once completed.
   - All security policies, NAS/NPS clients, LDAP directories, lockouts, OTP replay state, and append-only audit records are stored in the database for cluster-safe operation.
@@ -66,6 +69,29 @@ The RADIUS server listens on UDP (`radius.port`, default `1812`) and authorizes 
   - Applied per `RadiusClient.authMode` or `SecurityPolicy.defaultAuthMode` (`User.authMode` cannot be downgraded from `PASSWORD_AND_OTP` to `PASSWORD_ONLY` by a client policy).
 - **Diagnostics**: `Status-Server` (code `12`) with a valid RFC 3579 `Message-Authenticator` returns `Access-Accept`.
 
+### 6. OAuth 2.0 Machine-to-Machine Clients (`/oauth2/*`, `/v1/api/clients`)
+Connected systems are registered as confidential OAuth 2.0 clients in the `clients` table (`/v1/api/clients`, `ROLE_ADMIN` only). Each client has a `clientId`, BCrypt-hashed `clientSecret`, `name`, `enabled`, `blocked`, an optional `authMode` override, and `scopes`:
+
+| Scope | Grants access to |
+|---|---|
+| `auth:login` | `POST /v1/api/auth/login` |
+| `otp:validate` | `POST /v1/api/otp/validate`, `POST /v1/api/otp/validate-ocra` |
+| `mfa:preauth` | `POST /v1/api/mfa/preauth` |
+
+1. **Token request (RFC 6749 section 4.4)**: `POST /oauth2/token` with HTTP Basic client authentication (`client_secret_basic`, form-urlencoded `client_id:client_secret`) and form body `grant_type=client_credentials[&scope=...]`. An omitted `scope` defaults to the client's registered scopes; requesting unregistered or unknown scopes fails with `invalid_scope`. Parameters in the query string, repeated parameters, `client_secret` in the body and non-form content types are rejected. Responses carry `Cache-Control: no-store`; no refresh tokens are issued.
+   ```bash
+   curl -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials -d scope=otp:validate \
+        http://localhost:8081/oauth2/token
+   ```
+2. **Access tokens (RFC 9068 / RFC 7519 / RFC 7515)**: RS256 JWS compact serialization with header `{"typ":"at+jwt","alg":"RS256","kid":<RFC 7638 thumbprint>}` and claims `iss`, `sub` (= `client_id`), `aud`, `exp`, `iat`, `nbf`, `jti`, `client_id`, `scope`, and `ver` (client credential/permission version).
+3. **Calling protected endpoints (RFC 6750)**: `Authorization: Bearer <access_token>` only (tokens in query/form parameters are rejected). Missing tokens return `401` with `WWW-Authenticate: Bearer realm="iam"`; invalid, expired or revoked tokens `401 error="invalid_token"`; missing scopes `403 error="insufficient_scope"`. Verification accepts only `RS256` with a key from this server's own key store (`none`, symmetric algorithms, `crit`, `jku`/`jwk`/`x5u`/`x5c` headers are rejected) and validates `typ`, `iss`, `aud`, `exp`/`iat`/`nbf` (with `iam.oauth2.clock-skew-seconds`).
+4. **Introspection (RFC 7662)**: `POST /oauth2/introspect` (HTTP Basic, `token=...`) returns `{"active":true, scope, client_id, token_type, exp, iat, nbf, sub, aud, iss, jti}` for the caller's own valid tokens and `{"active":false}` otherwise.
+5. **Revocation (RFC 7009)**: `POST /oauth2/revoke` (HTTP Basic, `token=...[&token_type_hint=access_token]`) records the token `jti` in `oauth_revoked_tokens`; invalid or expired tokens are answered with `200`, tokens of another client with `400 unauthorized_client`.
+6. **JWK Set (RFC 7517 / RFC 7518)**: `GET /oauth2/jwks` (public, `application/jwk-set+json`) publishes the RSA public keys (`kty`, `use=sig`, `alg=RS256`, `kid`, `n`, `e`).
+7. **Per-client `AuthMode`**: `/v1/api/auth/login` resolves `User.authMode` -> calling client's `authMode` -> `SecurityPolicy.defaultAuthMode`, exactly like `RadiusClient.authMode` (a strict `PASSWORD_AND_OTP` account is never downgraded; it may submit its OTP inline for a `PASSWORD_AND_OTP_INLINE` client).
+
+**Client registry API** (`/v1/api/clients/all`, `/{id}`, `/create`, `PUT /{id}`, `DELETE /{id}`, `POST /{id}/rotate-secret`): `clientId` and `clientSecret` are generated when omitted on create; the plain secret is returned only in the create/rotation response. `PUT` is partial (omitted fields are preserved, explicit `"authMode": null` removes the override); a non-empty `clientSecret` rotates the secret. `blocked` reports persistent administrative blocks while `locked` and `lockedUntil` report active brute-force lockouts; setting `"blocked": false` unblocks the client and clears active lockouts.
+
 ---
 
 ## Security Architecture
@@ -77,12 +103,17 @@ The RADIUS server listens on UDP (`radius.port`, default `1812`) and authorizes 
   - **Post-password 2nd-factor OTP failures** and **`Admin` failures** lock the `OtpToken` (`OTP_TOKEN` scope) as well as the account (`ADMIN` / `RADIUS` scopes), blocking shared-token access across both roles.
 - **Single-Use Token & User Replay Defense (`OtpVerificationService`)**:
   - When an `OtpToken` is bound, TOTP time steps (`TOKEN:<id>`) and OCRA challenges are tracked against the token itself so an OTP consumed by a `User` cannot be replayed by an `Admin` (or vice versa) across web, REST, MFA pre-auth, or RADIUS.
+- **OAuth 2.0 Client Security**:
+  - **Brute force**: client secret verification on `/oauth2/token`, `/oauth2/introspect` and `/oauth2/revoke` uses the `SecurityPolicy` thresholds (`maxFailures`, `failureWindowSeconds`, `lockoutSeconds`) through the cluster-wide `AccountLockoutService` (`OAUTH_CLIENT` scope) with attempt reservation before the BCrypt comparison; unknown, disabled, blocked and locked clients incur equal BCrypt work and receive the same `invalid_client` response.
+  - **Immediate invalidation**: every bearer use and introspection re-checks the shared database: the `jti` revocation list, client existence, `enabled`, `blocked`, the token's scopes against the client's current scopes, and the `ver` claim. Rotating the secret, changing `clientId` or scopes, disabling, blocking or deleting a client regenerates its token version so previously issued tokens stop working on all nodes at once (re-enabling never revives them).
+  - **Cluster-safe keys**: RSA signing keys (`iam.oauth2.signing-key-size`, default 2048 bits) are stored in `oauth_signing_keys` and shared by all nodes, rotated every `iam.oauth2.signing-key-rotation-seconds` with the successor key pre-published in the JWK Set, and retired only after the tokens they signed have expired. Private keys are AES-256-GCM encrypted at rest when `iam.oauth2.key-encryption-secret` is set (strongly recommended).
+  - Bearer authentication is stateless (no HTTP session) and only applies to the four protected endpoints; bearer tokens never grant access to admin APIs, and admin sessions cannot call the protected endpoints without a token.
 - **Immutable Audit Trail (`AuthAuditLog`)**:
-  - Marked `@Immutable` with `@PreUpdate`/`@PreRemove` guards rejecting modification or deletion; logs `WEB_LOGIN`, `ADMIN_LOGIN`, `MFA_PREAUTH`, `OTP_VALIDATION`, and `RADIUS` events across `SUCCESS`, `FAILURE`, `LOCKED`, `CHALLENGE`, `ENROLLMENT_REQUIRED`, and `ERROR` outcomes.
+  - Marked `@Immutable` with `@PreUpdate`/`@PreRemove` guards rejecting modification or deletion; logs `WEB_LOGIN`, `ADMIN_LOGIN`, `MFA_PREAUTH`, `OTP_VALIDATION`, `RADIUS`, `OAUTH2_TOKEN`, `OAUTH2_INTROSPECTION`, `OAUTH2_REVOCATION`, `OAUTH2_BEARER` (rejected bearer tokens), and `OAUTH2_CLIENT_ADMIN` (client registry changes, with the acting admin) events across `SUCCESS`, `FAILURE`, `LOCKED`, `CHALLENGE`, `ENROLLMENT_REQUIRED`, and `ERROR` outcomes. Events of the protected REST endpoints record the calling OAuth 2.0 `client_id` (`clientName`) and remote address.
 - **Consistent REST API Errors (`GlobalExceptionHandler`)**:
   - Maps `BadRequestException` (`400`), `SetupAlreadyCompletedException` (`403`), `ResourceNotFoundException` (`404`), `ConflictException` (`409`), and validation errors to RFC 7807 `ProblemDetail` payloads with an `"error"` property.
 - **Access Control & DTOs (`SecurityConfig`, `UserResponse`, `AdminResponse`)**:
-  - Endpoints outside public auth/setup/OTP-validation paths require authentication (HTTP `401` on `/v1/api/**`, redirect to `/login` for browser routes).
+  - Connected-system endpoints require scoped bearer tokens, `/v1/api/clients/**` requires `ROLE_ADMIN`, and other endpoints outside public auth/setup paths require authentication (HTTP `401` on `/v1/api/**`, redirect to `/login` for browser routes).
   - API controllers bind `UserRequest` / `AdminRequest` DTOs (never JPA entities) and return `UserResponse` / `AdminResponse` excluding passwords and secrets; partial `PUT` updates preserve existing `enabled` status when omitted.
 
 ---
@@ -102,6 +133,20 @@ Runtime policies, NAS clients, and LDAP directories live in the database. Applic
 | `radius.worker-queue-capacity` | `1000` | Bounded queue capacity before packets are dropped |
 | `radius.duplicate-cache-seconds` | `30` | Retransmission cache TTL for identical UDP packets |
 | `radius.max-duplicate-cache-entries` | `100000` | Maximum cached duplicate request entries |
+
+### OAuth 2.0 Properties (`iam.oauth2.*`)
+Must be identical on every cluster node. Clients, signing keys and revocations live in the database.
+
+| Property | Default | Description |
+|---|---|---|
+| `iam.oauth2.issuer` | `urn:authprovider:iam` | `iss` claim of issued access tokens |
+| `iam.oauth2.audience` | `urn:authprovider:iam:api` | `aud` claim required on access tokens |
+| `iam.oauth2.access-token-ttl-seconds` | `300` | Access token lifetime (`expires_in`, 1-86400) |
+| `iam.oauth2.clock-skew-seconds` | `30` | Tolerated node clock difference for `exp`/`iat`/`nbf` |
+| `iam.oauth2.signing-key-size` | `2048` | RSA modulus size of generated signing keys (2048-8192) |
+| `iam.oauth2.signing-key-rotation-seconds` | `2592000` (30 days) | Signing key rotation interval |
+| `iam.oauth2.key-cache-seconds` | `30` | Per-node signing key cache lifetime (unknown `kid`s trigger a reload) |
+| `iam.oauth2.key-encryption-secret` | *(empty)* | Encrypts private signing keys at rest; supply via environment / secret store |
 
 ### Optional First-Boot Seeding (`iam.bootstrap.*`)
 Applied only when `iam.bootstrap.seed-defaults=true` (default) and the target table is empty:
@@ -156,10 +201,13 @@ Seeded as the `default` `LdapDirectory` only when `ldap_directories` is empty an
 | `SecurityPolicy` | `security_policies` | Cluster-wide `default` policy (lockout, TTLs, `stripRealm`, `defaultAuthMode`, `mfaOutOfBandEnabled`) |
 | `RadiusChallengeSession` | `radius_challenge_sessions` | Single-use in-band `Access-Challenge` `State` sessions bound to user and client IP |
 | `MfaApproval` | `mfa_approvals` | Single-use out-of-band MFA pre-authentication approvals |
-| `AuthFailureRecord` | `auth_failure_records` | Optimistically locked brute-force counters (`RADIUS`, `MFA_PREAUTH`, `ADMIN`, `OTP_TOKEN`) |
+| `AuthFailureRecord` | `auth_failure_records` | Optimistically locked brute-force counters (`RADIUS`, `MFA_PREAUTH`, `ADMIN`, `OTP_TOKEN`, `OAUTH_CLIENT`) |
 | `OtpReplayState` | `otp_replay_state` | Atomic monotonic TOTP time-step tracking per `TOKEN:<id>` or `USER:<id>` |
 | `OcraChallengeUse` | `ocra_challenge_uses` | Single-use hashed OCRA challenge replay tracking per `TOKEN:<id>` or `USER:<id>` |
 | `AuthAuditLog` | `auth_audit_logs` | Append-only (`@Immutable`) authentication audit log |
+| `OAuthClient` | `clients` | OAuth 2.0 M2M clients: `clientId`, BCrypt secret hash, `enabled`, `blocked`, optional `AuthMode`, scopes, token version |
+| `OAuthSigningKey` | `oauth_signing_keys` | Cluster-shared RS256 key pairs with signing / verification validity periods |
+| `OAuthRevokedToken` | `oauth_revoked_tokens` | RFC 7009 revoked access token `jti`s (purged after expiry) |
 
 ---
 
@@ -171,13 +219,17 @@ Seeded as the `default` `LdapDirectory` only when `ldap_directories` is empty an
 | `GET` | `/v1/api/setup/status` | Public | Returns whether initial setup is still required |
 | `POST` | `/v1/api/setup/admin` | Public (Day-0 only) | Creates initial local `Admin` + `Person` (locks setup) |
 | `POST` | `/v1/api/setup/ldap` | Public (Day-0 only) | Registers initial Admin `LdapDirectory` (locks setup) |
-| `POST` | `/v1/api/auth/login` | Public | End-user REST authentication across configured `AuthMode`s |
+| `POST` | `/oauth2/token` | HTTP Basic client | `client_credentials` grant issuing RS256 JWT access tokens |
+| `POST` | `/oauth2/introspect` | HTTP Basic client | RFC 7662 token introspection |
+| `POST` | `/oauth2/revoke` | HTTP Basic client | RFC 7009 access token revocation |
+| `GET` | `/oauth2/jwks` | Public | RFC 7517 JWK Set of token signing keys |
+| `POST` | `/v1/api/auth/login` | Bearer `auth:login` | End-user REST authentication across configured `AuthMode`s |
 | `POST` | `/v1/api/admin/auth/login` | Public | Admin REST login (primary + strict 2FA / enrollment) |
 | `GET` / `POST` | `/login`, `/login/otp`, `/login/enroll` | Public | CSRF-protected 2-step browser admin login & TOTP enrollment |
 | `GET` / `POST` | `/mfa` | Public | Browser MFA pre-authentication page for RDG |
-| `POST` | `/v1/api/mfa/preauth` | Public | Out-of-band MFA pre-authentication API |
-| `POST` | `/v1/api/otp/validate` | Public | Validates 6-digit TOTP by `username` |
-| `POST` | `/v1/api/otp/validate-ocra` | Public | Validates OCRA challenge-response by `username` |
+| `POST` | `/v1/api/mfa/preauth` | Bearer `mfa:preauth` | Out-of-band MFA pre-authentication API |
+| `POST` | `/v1/api/otp/validate` | Bearer `otp:validate` | Validates 6-digit TOTP by `username` |
+| `POST` | `/v1/api/otp/validate-ocra` | Bearer `otp:validate` | Validates OCRA challenge-response by `username` |
 | `POST` | `/v1/api/otp/generate` | Authenticated | Rotates/provisions TOTP secret by JSON `{"username": ...}` |
 | `POST` | `/v1/api/otp/generate/{username}` | Authenticated | Rotates/provisions TOTP secret for `username` |
 | `GET` / `POST` / `PUT` | `/v1/api/persons/**`, `/{id}/tokens`, `/tokens/{tokenId}/rotate` | Authenticated | Manages `Person` identities and `OtpToken` lifecycle/rotation |
@@ -185,6 +237,7 @@ Seeded as the `default` `LdapDirectory` only when `ldap_directories` is empty an
 | `GET/POST/PUT/DELETE` | `/v1/api/admins/all`, `/{id}`, `/create` | Authenticated | Manages admin accounts (`AdminRequest` / `AdminResponse`) |
 | `GET/POST/PUT/DELETE` | `/v1/api/radius-clients/all`, `/{id}`, `/create` | Authenticated | Manages allowed RADIUS clients and per-client secrets/modes |
 | `GET/POST/PUT/DELETE` | `/v1/api/ldap-directories/all`, `/{id}`, `/create` | Authenticated | Manages federated LDAP directories |
+| `GET/POST/PUT/DELETE` | `/v1/api/clients/all`, `/{id}`, `/create`, `/{id}/rotate-secret` | `ROLE_ADMIN` | Manages OAuth 2.0 M2M clients, scopes, secrets, blocks and auth modes |
 | `GET` / `PUT` | `/v1/api/policies/current` | Authenticated | Reads or updates the cluster-wide `default` `SecurityPolicy` |
 | `GET` / `POST` | `/users/**`, `/logout` | Authenticated | Thymeleaf admin user management & OTP QR views |
 
@@ -205,4 +258,6 @@ mvn clean test
 ```bash
 mvn spring-boot:run
 ```
+> **Upgrading existing databases**: the new `clients`, `oauth_signing_keys` and `oauth_revoked_tokens` tables are created by schema generation. If `auth_audit_logs.channel` was created with an enum `CHECK` constraint, extend it with the `OAUTH2_*` channels (or drop it) before upgrading.
+
 Service listens on HTTP port `8081` (`server.port`) and UDP RADIUS port `1812` (`radius.port`). Open `http://localhost:8081/` to launch first-run `/setup` or `/login`.
