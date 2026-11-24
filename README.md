@@ -38,11 +38,11 @@ When the database has no `Admin` accounts and no enabled Admin `LdapDirectory`:
 - As soon as setup completes, `/setup` redirects to `/login` and `/v1/api/setup/**` permanently reject further requests with HTTP `403`.
 
 ### 2. Unified User Login (`POST /v1/api/auth/login`)
-`LoginServiceImpl` evaluates authentication using the effective `AuthMode` (`User.authMode` -> `SecurityPolicy.defaultAuthMode`):
+`LoginServiceImpl` only authenticates accounts holding an **enabled assignment to the calling OAuth 2.0 client** (see [User to client assignments](#user-to-client-assignments)) and evaluates authentication using the effective `AuthMode` (assignment `authMode` -> client `authMode` -> `SecurityPolicy.defaultAuthMode`):
 1. **Primary Verification**:
    - In `OTP_ONLY` mode (without a password), authenticates directly against the user's enrolled TOTP secret.
    - In `PASSWORD_AND_OTP_INLINE` mode, splits the trailing 6 digits of `password` into primary password + TOTP when a separate `otp` field is omitted.
-   - If LDAP is enabled (`ldap_directories` with `enabled=true` and `userEnabled=true`), routes qualified names by realm or evaluates directories in priority order, with configurable JIT provisioning (`autoProvision`) or fallback to local BCrypt hashes (`fallbackToLocal`).
+   - If LDAP is enabled (`ldap_directories` with `enabled=true` and `userEnabled=true`), routes qualified names by realm or evaluates directories in priority order, with configurable JIT provisioning (`autoProvision`; a provisioned account is assigned to the calling OAuth 2.0 client only) or fallback to local BCrypt hashes (`fallbackToLocal`).
 2. **MFA Enrollment (`ENROLLMENT_REQUIRED`)**:
    - Unenrolled password accounts (except `PASSWORD_ONLY`) automatically receive a new Base32 secret, `otpauth://` URI, and Base64 PNG QR code while invalidating stale pending sessions.
 3. **MFA Verification (`AUTHENTICATED` / `OTP_REQUIRED`)**:
@@ -55,7 +55,7 @@ When the database has no `Admin` accounts and no enabled Admin `LdapDirectory`:
   2. Unenrolled admins confirm their generated TOTP secret on `/login/enroll`; enrolled admins submit TOTP on `/login/otp` before receiving `ROLE_ADMIN` session access.
 
 ### 4. Username-Based OTP & OCRA Validation (`/v1/api/otp/*`)
-- Public validation endpoints (`POST /v1/api/otp/validate`, `POST /v1/api/otp/validate-ocra`) resolve accounts by presented `username` (including realm stripping when configured) rather than internal database IDs, returning structured `OtpValidationResponse` statuses (`VALID`, `INVALID_OTP`, `LOCKED`, `NOT_ENROLLED`, `INVALID_REQUEST`) and writing `OTP_VALIDATION` audit records.
+- Bearer protected validation endpoints (`POST /v1/api/otp/validate`, `POST /v1/api/otp/validate-ocra`) only validate accounts assigned (enabled) to the calling OAuth 2.0 client, resolve accounts by presented `username` (including realm stripping when configured) rather than internal database IDs, returning structured `OtpValidationResponse` statuses (`VALID`, `INVALID_OTP`, `LOCKED`, `NOT_ENROLLED`, `INVALID_REQUEST`) and writing `OTP_VALIDATION` audit records.
 - Secret generation/rotation (`POST /v1/api/otp/generate` and `POST /v1/api/otp/generate/{username}`) requires authentication and immediately invalidates pending MFA approvals and RADIUS challenges.
 
 ### 5. Remote Desktop Gateway / RADIUS MFA
@@ -66,11 +66,12 @@ The RADIUS server listens on UDP (`radius.port`, default `1812`) and authorizes 
 - **In-Band Challenge-Response** (`PASSWORD_AND_OTP`, RFC 2865):
   - Step 1 validates primary credentials and returns `Access-Challenge` with a cryptographic `State` token and `Reply-Message` prompt; Step 2 consumes `State` (bound to user and client IP) and validates TOTP.
 - **Inline MFA (`PASSWORD_AND_OTP_INLINE`)**, **`PASSWORD_ONLY`**, and **`OTP_ONLY`**:
-  - Applied per `RadiusClient.authMode` or `SecurityPolicy.defaultAuthMode` (`User.authMode` cannot be downgraded from `PASSWORD_AND_OTP` to `PASSWORD_ONLY` by a client policy).
+  - Applied per user assignment `authMode`, `RadiusClient.authMode` or `SecurityPolicy.defaultAuthMode` (in that order).
+- **Client assignment**: every request is refused unless the user holds an enabled assignment to the requesting RADIUS client (also re-checked when answering an `Access-Challenge` and before consuming an out-of-band MFA approval).
 - **Diagnostics**: `Status-Server` (code `12`) with a valid RFC 3579 `Message-Authenticator` returns `Access-Accept`.
 
-### 6. OAuth 2.0 Machine-to-Machine Clients (`/oauth2/*`, `/v1/api/clients`)
-Connected systems are registered as confidential OAuth 2.0 clients in the `clients` table (`/v1/api/clients`, `ROLE_ADMIN` only). Each client has a `clientId`, BCrypt-hashed `clientSecret`, `name`, `enabled`, `blocked`, an optional `authMode` override, and `scopes`:
+### 6. OAuth 2.0 Machine-to-Machine Clients (`/oauth2/*`, `/v1/api/oauth-clients`)
+Connected systems are registered as confidential OAuth 2.0 clients in the `clients` table (`/v1/api/oauth-clients`, `ROLE_ADMIN` only). Each client has a `clientId`, BCrypt-hashed `clientSecret`, `name`, `enabled`, `blocked`, an optional `authMode` override, and `scopes`:
 
 | Scope | Grants access to |
 |---|---|
@@ -88,9 +89,12 @@ Connected systems are registered as confidential OAuth 2.0 clients in the `clien
 4. **Introspection (RFC 7662)**: `POST /oauth2/introspect` (HTTP Basic, `token=...`) returns `{"active":true, scope, client_id, token_type, exp, iat, nbf, sub, aud, iss, jti}` for the caller's own valid tokens and `{"active":false}` otherwise.
 5. **Revocation (RFC 7009)**: `POST /oauth2/revoke` (HTTP Basic, `token=...[&token_type_hint=access_token]`) records the token `jti` in `oauth_revoked_tokens`; invalid or expired tokens are answered with `200`, tokens of another client with `400 unauthorized_client`.
 6. **JWK Set (RFC 7517 / RFC 7518)**: `GET /oauth2/jwks` (public, `application/jwk-set+json`) publishes the RSA public keys (`kty`, `use=sig`, `alg=RS256`, `kid`, `n`, `e`).
-7. **Per-client `AuthMode`**: `/v1/api/auth/login` resolves `User.authMode` -> calling client's `authMode` -> `SecurityPolicy.defaultAuthMode`, exactly like `RadiusClient.authMode` (a strict `PASSWORD_AND_OTP` account is never downgraded; it may submit its OTP inline for a `PASSWORD_AND_OTP_INLINE` client).
+7. **Per-client `AuthMode`**: `/v1/api/auth/login` resolves the user's assignment `authMode` -> calling client's `authMode` -> `SecurityPolicy.defaultAuthMode`, exactly like RADIUS (a strict `PASSWORD_AND_OTP` assignment may submit its OTP inline for a `PASSWORD_AND_OTP_INLINE` client).
 
-**Client registry API** (`/v1/api/clients/all`, `/{id}`, `/create`, `PUT /{id}`, `DELETE /{id}`, `POST /{id}/rotate-secret`): `clientId` and `clientSecret` are generated when omitted on create; the plain secret is returned only in the create/rotation response. `PUT` is partial (omitted fields are preserved, explicit `"authMode": null` removes the override); a non-empty `clientSecret` rotates the secret. `blocked` reports persistent administrative blocks while `locked` and `lockedUntil` report active brute-force lockouts; setting `"blocked": false` unblocks the client and clears active lockouts.
+**Client registry API** (`/v1/api/oauth-clients/all`, `/{id}`, `/create`, `PUT /{id}`, `DELETE /{id}`, `POST /{id}/rotate-secret`): `clientId` and `clientSecret` are generated when omitted on create; the plain secret is returned only in the create/rotation response. `PUT` is partial (omitted fields are preserved, explicit `"authMode": null` removes the override); a non-empty `clientSecret` rotates the secret. `blocked` reports persistent administrative blocks while `locked` and `lockedUntil` report active brute-force lockouts; setting `"blocked": false` unblocks the client and clears active lockouts.
+
+### User to client assignments
+A user can only authenticate, validate an OTP / OCRA response or pre-authenticate MFA through a RADIUS or OAuth 2.0 client it holds an **enabled assignment** for; unassigned requests are refused with the generic failure response before any credential is checked (and without counting towards lockouts). Each assignment stores the client's database id (`clientId`), `enabled` (default `true`) and a nullable `authMode` that overrides the client's mode. Assignments are managed by administrators via `PUT /v1/api/users/{userId}/radius-clients/{clientId}` (body `{"enabled": true, "authMode": null}`, both optional; `PUT` replaces the assignment) and the matching `GET` / `DELETE` endpoints (likewise for `oauth-clients`), or as `radiusClients` / `oauthClients` lists in the `/v1/api/users` payloads (a list replaces the corresponding assignments). Deleting a user or client removes its assignments. Accounts auto-provisioned from LDAP during `/v1/api/auth/login` are assigned to the calling OAuth 2.0 client only.
 
 ---
 
@@ -112,8 +116,8 @@ Connected systems are registered as confidential OAuth 2.0 clients in the `clien
   - Marked `@Immutable` with `@PreUpdate`/`@PreRemove` guards rejecting modification or deletion; logs `WEB_LOGIN`, `ADMIN_LOGIN`, `MFA_PREAUTH`, `OTP_VALIDATION`, `RADIUS`, `OAUTH2_TOKEN`, `OAUTH2_INTROSPECTION`, `OAUTH2_REVOCATION`, `OAUTH2_BEARER` (rejected bearer tokens), and `OAUTH2_CLIENT_ADMIN` (client registry changes, with the acting admin) events across `SUCCESS`, `FAILURE`, `LOCKED`, `CHALLENGE`, `ENROLLMENT_REQUIRED`, and `ERROR` outcomes. Events of the protected REST endpoints record the calling OAuth 2.0 `client_id` (`clientName`) and remote address.
 - **Consistent REST API Errors (`GlobalExceptionHandler`)**:
   - Maps `BadRequestException` (`400`), `SetupAlreadyCompletedException` (`403`), `ResourceNotFoundException` (`404`), `ConflictException` (`409`), and validation errors to RFC 7807 `ProblemDetail` payloads with an `"error"` property.
-- **Access Control & DTOs (`SecurityConfig`, `UserResponse`, `AdminResponse`)**:
-  - Connected-system endpoints require scoped bearer tokens, `/v1/api/clients/**` requires `ROLE_ADMIN`, and other endpoints outside public auth/setup paths require authentication (HTTP `401` on `/v1/api/**`, redirect to `/login` for browser routes).
+- **Access Control & DTOs (`SecurityConfig`, `UserResponse`, `AdminResponse`, `OpenApiConfig`)**:
+  - Connected-system endpoints require scoped bearer tokens, `/v1/api/clients/**`, `/v1/api/oauth-clients/**`, `/v1/api/users/{userId}/radius-clients|oauth-clients/**`, `/v3/api-docs/**` and `/swagger-ui/**` require `ROLE_ADMIN`, and other endpoints outside public auth/setup paths require authentication (HTTP `401` on `/v1/api/**` and `/v3/api-docs/**`, redirect to `/login` for browser routes).
   - API controllers bind `UserRequest` / `AdminRequest` DTOs (never JPA entities) and return `UserResponse` / `AdminResponse` excluding passwords and secrets; partial `PUT` updates preserve existing `enabled` status when omitted.
 
 ---
@@ -192,9 +196,11 @@ Seeded as the `default` `LdapDirectory` only when `ldap_directories` is empty an
 
 | Entity | Table | Purpose |
 |---|---|---|
-| `Person` | `persons` | Natural identity owning `OtpToken`s and linked accounts (`enabled` master switch) |
+| `Person` | `persons` | Natural identity (`firstName`, `lastName`, `displayName`, unique `email`, `mobile`, `nationalCode`) owning `OtpToken`s and linked accounts (`enabled` master switch) |
 | `OtpToken` | `otp_tokens` | Single source of truth for hardware/app TOTP & OCRA secrets |
-| `User` | `users` | End-user login principal, local BCrypt password, `Person`/`OtpToken` links, optional `AuthMode` |
+| `User` | `users` | End-user login principal, local BCrypt password, `Person`/`OtpToken` links (no OTP secret of its own) |
+| `UserRadiusClient` | `user_radius_clients` | Assignment of a user to a RADIUS client: `clientId`, `enabled` (default `true`), optional `authMode` override |
+| `UserOAuthClient` | `user_oauth_clients` | Assignment of a user to an OAuth 2.0 client: `clientId`, `enabled` (default `true`), optional `authMode` override |
 | `Admin` | `admins` | Privileged admin principal linked to `Person` and `OtpToken` with strict 2FA |
 | `RadiusClient` | `radius_clients` | NAS/NPS clients: CIDR/IP match, shared secret, active flag, optional `AuthMode` |
 | `LdapDirectory` | `ldap_directories` | Federated LDAP configs with `userEnabled`/`adminEnabled` separation, realms, and priority |
@@ -232,14 +238,19 @@ Seeded as the `default` `LdapDirectory` only when `ldap_directories` is empty an
 | `POST` | `/v1/api/otp/validate-ocra` | Bearer `otp:validate` | Validates OCRA challenge-response by `username` |
 | `POST` | `/v1/api/otp/generate` | Authenticated | Rotates/provisions TOTP secret by JSON `{"username": ...}` |
 | `POST` | `/v1/api/otp/generate/{username}` | Authenticated | Rotates/provisions TOTP secret for `username` |
-| `GET` / `POST` / `PUT` | `/v1/api/persons/**`, `/{id}/tokens`, `/tokens/{tokenId}/rotate` | Authenticated | Manages `Person` identities and `OtpToken` lifecycle/rotation |
-| `GET/POST/PUT/DELETE` | `/v1/api/users/all`, `/{id}`, `/create` | Authenticated | Manages end-user accounts (`UserRequest` / `UserResponse`) |
+| `GET` / `POST` / `PUT` / `DELETE` | `/v1/api/persons/**`, `/{id}/tokens`, `/tokens/{tokenId}/rotate` | Authenticated | Manages `Person` profiles and `OtpToken` lifecycle/rotation |
+| `POST` | `/v1/api/registration`, `/v1/api/users/register` | `ROLE_ADMIN` | Atomically creates/links `Person`, optional `OtpToken`, `User`, and client assignments |
+| `GET/POST/PUT/DELETE` | `/v1/api/users/all`, `/{id}`, `/create` | Authenticated | Manages end-user accounts (`UserRequest` / `UserResponse`, including `radiusClients` / `oauthClients` assignments) |
 | `GET/POST/PUT/DELETE` | `/v1/api/admins/all`, `/{id}`, `/create` | Authenticated | Manages admin accounts (`AdminRequest` / `AdminResponse`) |
 | `GET/POST/PUT/DELETE` | `/v1/api/radius-clients/all`, `/{id}`, `/create` | Authenticated | Manages allowed RADIUS clients and per-client secrets/modes |
 | `GET/POST/PUT/DELETE` | `/v1/api/ldap-directories/all`, `/{id}`, `/create` | Authenticated | Manages federated LDAP directories |
-| `GET/POST/PUT/DELETE` | `/v1/api/clients/all`, `/{id}`, `/create`, `/{id}/rotate-secret` | `ROLE_ADMIN` | Manages OAuth 2.0 M2M clients, scopes, secrets, blocks and auth modes |
+| `GET/POST/PUT/DELETE` | `/v1/api/oauth-clients/all`, `/{id}`, `/create`, `/{id}/rotate-secret` | `ROLE_ADMIN` | Manages OAuth 2.0 M2M clients, scopes, secrets, blocks and auth modes |
+| `GET` | `/v1/api/clients/all[?type=RADIUS\|OAUTH2]` | `ROLE_ADMIN` | Lists all clients across types (`id`, `type`, `name`, `enabled`, `authMode`; no secrets) |
+| `GET` / `GET` / `PUT` / `DELETE` | `/v1/api/users/{userId}/radius-clients`, `/{clientId}` | `ROLE_ADMIN` | Lists, reads, creates/replaces and removes a user's RADIUS client assignments |
+| `GET` / `GET` / `PUT` / `DELETE` | `/v1/api/users/{userId}/oauth-clients`, `/{clientId}` | `ROLE_ADMIN` | Lists, reads, creates/replaces and removes a user's OAuth 2.0 client assignments |
 | `GET` / `PUT` | `/v1/api/policies/current` | Authenticated | Reads or updates the cluster-wide `default` `SecurityPolicy` |
 | `GET` / `POST` | `/users/**`, `/logout` | Authenticated | Thymeleaf admin user management & OTP QR views |
+| `GET` | `/v3/api-docs`, `/swagger-ui.html` | `ROLE_ADMIN` | OpenAPI v3 specification and Swagger UI for `/v1/api/**` and `/oauth2/**` |
 
 ---
 

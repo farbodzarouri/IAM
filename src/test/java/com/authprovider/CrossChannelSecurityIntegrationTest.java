@@ -94,6 +94,8 @@ class CrossChannelSecurityIntegrationTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     @Autowired private MockMvc mockMvc;
+
+    @Autowired private com.authprovider.TestClientAssignments assignments;
     @Autowired private LoginService loginService;
     @Autowired private MfaPreAuthService mfaPreAuthService;
     private static final Base32 BASE32 = new Base32();
@@ -173,7 +175,7 @@ class CrossChannelSecurityIntegrationTest {
         return userService.saveUser(User.builder()
                 .username(username)
                 .password(password)
-                .secret(secret)
+                .otpToken(com.authprovider.TestUsers.token(secret))
                 .build());
     }
 
@@ -236,6 +238,7 @@ class CrossChannelSecurityIntegrationTest {
     }
 
     private RadiusPacket sendRadius(int port, String sharedSecret, String userName, String password, byte[] state) throws Exception {
+        assignments.assignAll();
         byte[] secretBytes = sharedSecret.getBytes(StandardCharsets.UTF_8);
         byte[] authenticator = new byte[16];
         RANDOM.nextBytes(authenticator);
@@ -911,9 +914,11 @@ class CrossChannelSecurityIntegrationTest {
             String cCurr = otpForStep(cSecret, clusterStep);
 
             User clusterUser = node1.getBean(UserService.class).saveUser(User.builder()
-                    .username("cluster-alice").password(PASSWORD).secret(cSecret).build());
+                    .username("cluster-alice").password(PASSWORD).otpToken(com.authprovider.TestUsers.token(cSecret)).build());
             User isolatedUser = isolatedNode.getBean(UserService.class).saveUser(User.builder()
-                    .username("cluster-alice").password(PASSWORD).secret(cSecret).build());
+                    .username("cluster-alice").password(PASSWORD).otpToken(com.authprovider.TestUsers.token(cSecret)).build());
+            node1.getBean(com.authprovider.TestClientAssignments.class).assignAll();
+            isolatedNode.getBean(com.authprovider.TestClientAssignments.class).assignAll();
 
             // 1. TOTP step T accepted on node1 blocks both T and T-1 on node2 across channels, but NOT on an isolated DB
             assertTrue(node1.getBean(LoginService.class).login(LoginRequest.builder()
@@ -950,9 +955,11 @@ class CrossChannelSecurityIntegrationTest {
 
             // 4. Failures spread across node1 and node2 trigger shared lockout visible to both nodes, without leaking via JVM statics
             User lockUser = node1.getBean(UserService.class).saveUser(User.builder()
-                    .username("cluster-lock").password(PASSWORD).secret(cSecret).build());
+                    .username("cluster-lock").password(PASSWORD).otpToken(com.authprovider.TestUsers.token(cSecret)).build());
             isolatedNode.getBean(UserService.class).saveUser(User.builder()
-                    .username("cluster-lock").password(PASSWORD).secret(cSecret).build());
+                    .username("cluster-lock").password(PASSWORD).otpToken(com.authprovider.TestUsers.token(cSecret)).build());
+            node1.getBean(com.authprovider.TestClientAssignments.class).assignAll();
+            isolatedNode.getBean(com.authprovider.TestClientAssignments.class).assignAll();
             assertFalse(node1.getBean(LoginService.class).login(LoginRequest.builder()
                     .username("cluster-lock").password("bad").build()).isAuthenticated());
             assertFalse(node2.getBean(MfaPreAuthService.class).preAuthenticate("cluster-lock", 999999));
@@ -1148,9 +1155,8 @@ class CrossChannelSecurityIntegrationTest {
         while (newRemSecret.equals(remSecret)) {
             newRemSecret = secretGenerator.generateSecret();
         }
-        User remReloaded = userService.getUserById(remUser.getId());
-        remReloaded.setSecret(newRemSecret);
-        userService.saveUser(remReloaded);
+        userService.updateUser(remUser.getId(),
+                com.authprovider.dto.UserRequest.builder().secret(newRemSecret).build());
 
         assertFalse(mfaPreAuthService.hasActiveApproval("rem-user"),
                 "Modifying OTP secret via user update must immediately invalidate pending MFA approval");

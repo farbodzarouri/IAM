@@ -49,6 +49,12 @@ class RadiusLdapIntegrationTest {
     private RadiusServer radiusServer;
     @Autowired
     private UserRepository userRepository;
+
+    @Autowired
+    private com.authprovider.service.UserService userService;
+
+    @Autowired
+    private com.authprovider.TestClientAssignments assignments;
     @Autowired
     private TotpService totpService;
     @Autowired
@@ -73,39 +79,46 @@ class RadiusLdapIntegrationTest {
 
     @Test
     void enrolledDirectoryUserAuthenticatesWithDirectoryPasswordAndOtp() throws Exception {
-        userRepository.save(User.builder().username("alice").secret(TOTP_SECRET).build());
+        userService.saveUser(User.builder().username("alice").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
 
+        assignments.assignAll();
         RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("alice", "Password123!", null));
         assertEquals(ACCESS_CHALLENGE, challenge.getCode());
         byte[] state = challenge.getAttribute(ATTR_STATE).orElseThrow().getValue();
 
+        assignments.assignAll();
         RadiusPacket accept = client.sendExpectingResponse(client.accessRequest("alice", otp(TOTP_SECRET), state));
         assertEquals(ACCESS_ACCEPT, accept.getCode());
     }
 
     @Test
     void domainQualifiedDirectoryUserIsResolved() throws Exception {
-        userRepository.save(User.builder().username("alice").secret(TOTP_SECRET).build());
+        userService.saveUser(User.builder().username("alice").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
 
+        assignments.assignAll();
         RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("CONTOSO\\alice", "Password123!", null));
         assertEquals(ACCESS_CHALLENGE, challenge.getCode());
         byte[] state = challenge.getAttribute(ATTR_STATE).orElseThrow().getValue();
+        assignments.assignAll();
         assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(
                 client.accessRequest("CONTOSO\\alice", otp(TOTP_SECRET), state)).getCode());
     }
 
     @Test
     void wrongDirectoryPasswordIsRejectedEvenIfLocalPasswordMatches() throws Exception {
-        userRepository.save(User.builder().username("alice").password("LocalAlicePass!").secret(TOTP_SECRET).build());
+        userService.saveUser(User.builder().username("alice").password("LocalAlicePass!").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
 
+        assignments.assignAll();
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                 client.accessRequest("alice", "LocalAlicePass!", null)).getCode());
+        assignments.assignAll();
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                 client.accessRequest("alice", "WrongPassword!", null)).getCode());
     }
 
     @Test
     void directoryUserWithoutLocalAccountIsRejectedAndNotProvisioned() throws Exception {
+        assignments.assignAll();
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                 client.accessRequest("bob", "BobLdapPass!", null)).getCode());
         assertTrue(userRepository.findAllByUsernameIgnoreCase("bob").isEmpty(),
@@ -116,6 +129,7 @@ class RadiusLdapIntegrationTest {
     void directoryUserNotEnrolledInTwoFactorIsRejected() throws Exception {
         userRepository.save(User.builder().username("bob").build());
 
+        assignments.assignAll();
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                 client.accessRequest("bob", "BobLdapPass!", null)).getCode());
         assertNull(userRepository.findByUsername("bob").orElseThrow().getSecret());
@@ -123,22 +137,25 @@ class RadiusLdapIntegrationTest {
 
     @Test
     void localOnlyUserIsRejectedWhenFallbackDisabled() throws Exception {
-        userRepository.save(User.builder().username("localadmin").password("LocalAdminPass!").secret(TOTP_SECRET).build());
+        userService.saveUser(User.builder().username("localadmin").password("LocalAdminPass!").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
 
+        assignments.assignAll();
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                 client.accessRequest("localadmin", "LocalAdminPass!", null)).getCode());
     }
 
     @Test
     void outOfBandPreAuthenticationStillWorksWithDirectoryEnabled() throws Exception {
-        userRepository.save(User.builder().username("alice").secret(TOTP_SECRET).build());
+        userService.saveUser(User.builder().username("alice").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
 
         mockMvc.perform(post("/v1/api/mfa/preauth").with(bearer()).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"username\":\"alice\",\"otp\":" + totpService.generateOtp(TOTP_SECRET) + "}"))
                 .andExpect(status().isOk()).andExpect(content().string("true"));
 
+        assignments.assignAll();
         assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(
                 client.accessRequest("alice", null, null)).getCode());
+        assignments.assignAll();
         assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                 client.accessRequest("alice", null, null)).getCode());
     }
@@ -151,9 +168,11 @@ class RadiusLdapIntegrationTest {
         String secret = userRepository.findByUsername("alice").orElseThrow().getSecret();
         assertNotNull(secret);
 
+        assignments.assignAll();
         RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("alice", "Password123!", null));
         assertEquals(ACCESS_CHALLENGE, challenge.getCode());
         byte[] state = challenge.getAttribute(ATTR_STATE).orElseThrow().getValue();
+        assignments.assignAll();
         assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(
                 client.accessRequest("alice", otp(secret), state)).getCode());
     }

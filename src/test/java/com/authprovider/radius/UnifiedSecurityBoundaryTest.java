@@ -56,6 +56,8 @@ class UnifiedSecurityBoundaryTest {
     private static final String SECRET = "JBSWY3DPEHPK3PXP";
 
     @Autowired private RadiusServer radiusServer;
+
+    @Autowired private com.authprovider.TestClientAssignments assignments;
     @Autowired private UserRepository userRepository;
     @Autowired private UserService userService;
     @Autowired private TotpService totpService;
@@ -87,7 +89,7 @@ class UnifiedSecurityBoundaryTest {
         policy.setMaxFailures(3);
         policy.setMfaMaxFailedAttempts(5);
         policyRepository.save(policy);
-        user = userRepository.save(User.builder().username("unified").password(PASSWORD).secret(SECRET).build());
+        user = userService.saveUser(User.builder().username("unified").password(PASSWORD).otpToken(com.authprovider.TestUsers.token(SECRET)).build());
     }
 
     @AfterEach
@@ -112,6 +114,7 @@ class UnifiedSecurityBoundaryTest {
         assertFalse(mfaPreAuthService.preAuthenticate("unified", Integer.parseInt(otp())));
         assertEquals(false, userOtpService.validateUserOtp(user.getId(), Integer.parseInt(otp())).orElse(true));
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("unified", PASSWORD, null)).getCode());
         }
         assertFalse(webLogin(PASSWORD, otp()).isAuthenticated());
@@ -121,6 +124,7 @@ class UnifiedSecurityBoundaryTest {
     void unapprovedOutOfBandRequestsLockTheAccount() throws Exception {
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
             for (int i = 0; i < 3; i++) {
+                assignments.assignAll();
                 assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("unified", null, null)).getCode());
             }
         }
@@ -145,9 +149,11 @@ class UnifiedSecurityBoundaryTest {
         assertFalse(mfaPreAuthService.preAuthenticate("unified", Integer.parseInt(code)));
         assertEquals(false, userOtpService.validateUserOtp(user.getId(), Integer.parseInt(code)).orElse(true));
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("unified", PASSWORD, null));
             assertEquals(ACCESS_CHALLENGE, challenge.getCode());
             byte[] state = challenge.getAttribute(ATTR_STATE).orElseThrow().getValue();
+            assignments.assignAll();
             assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("unified", code, state)).getCode());
         }
     }
@@ -195,11 +201,14 @@ class UnifiedSecurityBoundaryTest {
 
     @Test
     void mismatchedChallengeResponseDoesNotDestroyChallenge() throws Exception {
-        userRepository.save(User.builder().username("other").password(PASSWORD).secret(SECRET).build());
+        userService.saveUser(User.builder().username("other").password(PASSWORD).otpToken(com.authprovider.TestUsers.token(SECRET)).build());
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("unified", PASSWORD, null));
             byte[] state = challenge.getAttribute(ATTR_STATE).orElseThrow().getValue();
+            assignments.assignAll();
             assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("other", otp(), state)).getCode());
+            assignments.assignAll();
             assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(client.accessRequest("unified", otp(), state)).getCode());
         }
     }
@@ -208,6 +217,7 @@ class UnifiedSecurityBoundaryTest {
     void pendingSessionsInvalidatedOnCredentialChangeDeletionAndLockout() throws Exception {
         assertTrue(mfaPreAuthService.preAuthenticate("unified", Integer.parseInt(otp())));
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             assertEquals(ACCESS_CHALLENGE, client.sendExpectingResponse(client.accessRequest("unified", PASSWORD, null)).getCode());
         }
         assertEquals(1, approvalRepository.count());
@@ -219,6 +229,7 @@ class UnifiedSecurityBoundaryTest {
         assertEquals(0, challengeRepository.count());
 
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             assertEquals(ACCESS_CHALLENGE, client.sendExpectingResponse(client.accessRequest("unified", "N3w!Password", null)).getCode());
         }
         assertEquals(1, challengeRepository.count());
@@ -226,6 +237,7 @@ class UnifiedSecurityBoundaryTest {
         assertEquals(0, challengeRepository.count());
 
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             assertEquals(ACCESS_CHALLENGE, client.sendExpectingResponse(client.accessRequest("unified", "N3w!Password", null)).getCode());
         }
         for (int i = 0; i < 3; i++) {
@@ -235,6 +247,7 @@ class UnifiedSecurityBoundaryTest {
 
         lockoutService.recordSuccess(user.getId());
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             assertEquals(ACCESS_CHALLENGE, client.sendExpectingResponse(client.accessRequest("unified", "N3w!Password", null)).getCode());
         }
         userService.deleteUser(user.getId());
@@ -243,14 +256,16 @@ class UnifiedSecurityBoundaryTest {
 
     @Test
     void approvalsOfRealmSimilarAccountsAreIsolated() throws Exception {
-        User partner = userRepository.save(User.builder().username("unified@partner.example").password(PASSWORD)
-                .secret("KRSXG5CTMVRXEZLU").build());
+        User partner = userService.saveUser(User.builder().username("unified@partner.example").password(PASSWORD)
+                .otpToken(com.authprovider.TestUsers.token("KRSXG5CTMVRXEZLU")).build());
         assertTrue(mfaPreAuthService.preAuthenticate("unified", Integer.parseInt(otp())));
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
             // Resolves to the partner account, which has no approval: rejected, unified's approval untouched.
+            assignments.assignAll();
             assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                     client.accessRequest("unified@partner.example", null, null)).getCode());
             assertTrue(mfaPreAuthService.hasActiveApproval("unified"));
+            assignments.assignAll();
             assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(client.accessRequest("CORP\\unified", null, null)).getCode());
         }
         // The unapproved request was charged to the partner account only.
@@ -329,6 +344,7 @@ class UnifiedSecurityBoundaryTest {
         assertEquals(false, userOtpService.validateUserOcra(
                 user.getId(), challenge, ocraService.generateOcra(SECRET, challenge)).orElse(true));
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "unified-secret")) {
+            assignments.assignAll();
             assertEquals(ACCESS_REJECT, client.sendExpectingResponse(
                     client.accessRequest("unified", PASSWORD, null)).getCode());
         }
@@ -356,10 +372,10 @@ class UnifiedSecurityBoundaryTest {
 
     @Test
     void mfaPreAuthLockoutIsIsolatedFromRealmDistinctAndUnknownAccounts() throws Exception {
-        User partner = userRepository.save(User.builder()
+        User partner = userService.saveUser(User.builder()
                 .username("unified@partner.example")
                 .password(PASSWORD)
-                .secret("KRSXG5CTMVRXEZLU")
+                .otpToken(com.authprovider.TestUsers.token("KRSXG5CTMVRXEZLU"))
                 .build());
         TotpServiceImpl totpImpl = new TotpServiceImpl(new HmacOtpProcessor(), clock);
         long step = stableStep();
@@ -379,7 +395,7 @@ class UnifiedSecurityBoundaryTest {
         User future = userService.saveUser(User.builder()
                 .username("future")
                 .password(PASSWORD)
-                .secret(SECRET)
+                .otpToken(com.authprovider.TestUsers.token(SECRET))
                 .build());
         assertFalse(lockoutService.isLocked(future.getId()));
         assertTrue(mfaPreAuthService.preAuthenticate("future", valid));

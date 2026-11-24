@@ -97,6 +97,8 @@ class PersonAdminAuthIntegrationTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     @Autowired private MockMvc mockMvc;
+
+    @Autowired private com.authprovider.TestClientAssignments assignments;
     @Autowired private DatabaseConfigurationBootstrap bootstrap;
     @Autowired private PersonService personService;
     @Autowired private AccountLockoutService lockoutService;
@@ -257,12 +259,14 @@ class PersonAdminAuthIntegrationTest {
     }
 
     private RadiusPacket sendRadius(String userName, String password, byte[] state) throws Exception {
+        assignments.assignAll();
         RadiusPacket packet = trySendRadius(RADIUS_SECRET, userName, password, state, 3000);
         assertNotNull(packet, "Expected RADIUS response for " + userName);
         return packet;
     }
 
     private RadiusPacket trySendRadius(String sharedSecret, String userName, String password, byte[] state, int timeoutMs) throws Exception {
+        assignments.assignAll();
         byte[] secretBytes = sharedSecret.getBytes(StandardCharsets.UTF_8);
         byte[] authenticator = new byte[16];
         RANDOM.nextBytes(authenticator);
@@ -527,7 +531,6 @@ class PersonAdminAuthIntegrationTest {
         User aliceUser = userRepository.save(User.builder()
                 .username("alice")
                 .password(USER_PASS)
-                .secret(secret)
                 .person(person)
                 .otpToken(token)
                 .build());
@@ -576,7 +579,6 @@ class PersonAdminAuthIntegrationTest {
         userRepository.save(User.builder()
                 .username("carol")
                 .password(USER_PASS)
-                .secret(carolSecret)
                 .person(carolPerson)
                 .otpToken(carolToken)
                 .build());
@@ -608,7 +610,7 @@ class PersonAdminAuthIntegrationTest {
         Person person = personService.createPerson(Person.builder().displayName("Kill Switch").build());
         OtpToken token = personService.createToken(person.getId(), "tok", secret);
         User user = userRepository.save(User.builder()
-                .username("ksuser").password(USER_PASS).secret(secret).person(person).otpToken(token).build());
+                .username("ksuser").password(USER_PASS).person(person).otpToken(token).build());
         adminRepository.save(Admin.builder()
                 .username("ksadmin").password(ADMIN_PASS).person(person).otpToken(token).build());
 
@@ -650,7 +652,7 @@ class PersonAdminAuthIntegrationTest {
         Person alicePerson = personService.createPerson(Person.builder().displayName("Alice Corp").build());
         OtpToken aliceToken = personService.createToken(alicePerson.getId(), "alice-tok", aliceSecret);
         userRepository.save(User.builder()
-                .username("alice").password(USER_PASS).secret(aliceSecret).person(alicePerson).otpToken(aliceToken).build());
+                .username("alice").password(USER_PASS).person(alicePerson).otpToken(aliceToken).build());
         adminRepository.save(Admin.builder()
                 .username("alice.admin").person(alicePerson).otpToken(aliceToken).build());
 

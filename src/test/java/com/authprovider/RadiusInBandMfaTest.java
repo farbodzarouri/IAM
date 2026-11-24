@@ -41,6 +41,12 @@ public class RadiusInBandMfaTest {
     private UserRepository userRepository;
 
     @Autowired
+    private com.authprovider.TestClientAssignments assignments;
+
+    @Autowired
+    private com.authprovider.service.UserService userService;
+
+    @Autowired
     private SecretGenerator secretGenerator;
 
     @Autowired
@@ -58,16 +64,17 @@ public class RadiusInBandMfaTest {
         alice = User.builder()
                 .username("alice")
                 .password("AlicePass123!")
-                .secret(secretGenerator.generateSecret())
+                .otpToken(com.authprovider.TestUsers.token(secretGenerator.generateSecret()))
                 .build();
 
         bob = User.builder()
                 .username("bob")
                 .password("BobPass456!")
-                .secret(secretGenerator.generateSecret())
+                .otpToken(com.authprovider.TestUsers.token(secretGenerator.generateSecret()))
                 .build();
 
-        userRepository.saveAll(List.of(alice, bob));
+        alice = userService.saveUser(alice);
+        bob = userService.saveUser(bob);
     }
 
     @Test
@@ -476,6 +483,7 @@ public class RadiusInBandMfaTest {
     }
 
     private byte[] sendRadiusPacket(byte[] packetBytes, int timeoutMs) throws Exception {
+        assignments.assignAll();
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setSoTimeout(timeoutMs);
             DatagramPacket req = new DatagramPacket(

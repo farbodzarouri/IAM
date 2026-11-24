@@ -11,7 +11,9 @@ import com.authprovider.exception.ResourceNotFoundException;
 import com.authprovider.oauth2.Base64Url;
 import com.authprovider.oauth2.ClientAuthenticator;
 import com.authprovider.repository.OAuthClientRepository;
+import com.authprovider.repository.UserOAuthClientRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.security.core.Authentication;
@@ -57,6 +59,12 @@ public class ClientServiceImpl implements ClientService {
     private final SecureRandom random;
     private final Clock clock;
     private final TransactionTemplate transactionTemplate;
+    private UserOAuthClientRepository oauthAssignmentRepository;
+
+    @Autowired(required = false)
+    public void setOauthAssignmentRepository(UserOAuthClientRepository oauthAssignmentRepository) {
+        this.oauthAssignmentRepository = oauthAssignmentRepository;
+    }
 
     private record Change(OAuthClient client, String plainSecret, List<String> events, boolean clearLockout) {
     }
@@ -217,6 +225,9 @@ public class ClientServiceImpl implements ClientService {
     public void deleteClient(Long id) {
         Change change = execute(() -> {
             OAuthClient client = getOrThrow(id);
+            if (oauthAssignmentRepository != null) {
+                oauthAssignmentRepository.deleteByClientId(id);
+            }
             repository.delete(client);
             repository.flush();
             return new Change(client, null, List.of("CLIENT_DELETED"), true);

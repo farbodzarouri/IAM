@@ -6,6 +6,7 @@ import com.authprovider.entity.User;
 import com.authprovider.service.AuthAuditService;
 import com.authprovider.service.MfaPreAuthService;
 import com.authprovider.service.SecurityPolicyService;
+import com.authprovider.service.UserClientAssignmentService;
 import com.authprovider.service.UserOtpService;
 import com.authprovider.service.UsernameNormalizer;
 import lombok.extern.slf4j.Slf4j;
@@ -41,9 +42,11 @@ public class RadiusAuthenticationHandler {
     private final RadiusClientRegistry clientRegistry;
     private final SecurityPolicyService policyService;
     private final AuthAuditService auditService;
+    private UserClientAssignmentService assignmentService;
 
-    /** Per-request context: the sending client, its shared secret, and optional client auth mode. */
-    private record RequestContext(InetAddress address, String clientName, byte[] secret, AuthMode authMode) {
+    /** Per-request context: the sending client (database id and name), its shared secret, and optional auth mode. */
+    private record RequestContext(InetAddress address, Long clientId, String clientName, byte[] secret,
+                                  AuthMode authMode) {
         String host() {
             return address == null ? "unknown" : address.getHostAddress();
         }
@@ -83,6 +86,15 @@ public class RadiusAuthenticationHandler {
         }
     }
 
+    /**
+     * Enables enforcement of user to RADIUS client assignments: a user can only authenticate through a client
+     * it holds an enabled assignment for, and the assignment's authentication mode overrides the client's.
+     */
+    @Autowired(required = false)
+    public void setAssignmentService(UserClientAssignmentService assignmentService) {
+        this.assignmentService = assignmentService;
+    }
+
     RadiusClientRegistry getClientRegistry() {
         return clientRegistry;
     }
@@ -103,7 +115,8 @@ public class RadiusAuthenticationHandler {
 
     /** Handles a request from an already resolved client. */
     public Optional<byte[]> handle(RadiusPacket request, InetAddress clientAddress, RadiusClientRegistry.ResolvedClient client) {
-        RequestContext context = new RequestContext(clientAddress, client.name(), client.secret(), client.authMode());
+        RequestContext context = new RequestContext(clientAddress, client.id(), client.name(), client.secret(),
+                client.authMode());
         return switch (request.getCode()) {
             case ACCESS_REQUEST -> handleAccessRequest(request, context);
             case STATUS_SERVER -> handleStatusServer(request, context);
@@ -209,6 +222,9 @@ public class RadiusAuthenticationHandler {
                     List.of(RadiusAttribute.ofString(ATTR_REPLY_MESSAGE, OUT_OF_BAND_REJECT_MESSAGE)));
         }
         Long userId = account.get().getId();
+        if (!isAssigned(context, account.get())) {
+            return notAssigned(request, context, userName, userId, null);
+        }
         if (isUserOrTokenBlocked(account.get())) {
             log.warn("RADIUS authentication refused for locked-out or disabled user '{}' from {}", safeUser, client);
             audit(context, userName, userId, AuthAuditLog.Outcome.LOCKED, "LOCKED_OUT", null);
@@ -229,6 +245,11 @@ public class RadiusAuthenticationHandler {
 
     private byte[] handleInitialRequest(RadiusPacket request, RequestContext context, String userName, byte[] password) {
         Optional<User> candidate = credentialVerifier.findUser(userName);
+        if (candidate.isPresent() && !isAssigned(context, candidate.get())) {
+            // Accounts not assigned to this client are refused before any credential is checked.
+            credentialVerifier.simulatePasswordCheck(password);
+            return notAssigned(request, context, userName, candidate.get().getId(), null);
+        }
         AuthMode effectiveMode = resolveEffectiveAuthMode(context, candidate.orElse(null));
         return switch (effectiveMode) {
             case OTP_ONLY -> handleOtpOnlyAuthentication(request, context, userName, candidate.orElse(null), password);
@@ -243,13 +264,50 @@ public class RadiusAuthenticationHandler {
         AuthMode base = context.authMode() != null
                 ? context.authMode()
                 : policyService.current().getDefaultAuthMode();
-        if (user != null && user.getAuthMode() != null) {
-            if (user.getAuthMode() == AuthMode.PASSWORD_AND_OTP && base == AuthMode.PASSWORD_AND_OTP_INLINE) {
+        AuthMode assigned = assignmentAuthMode(context, user);
+        if (assigned != null) {
+            if (assigned == AuthMode.PASSWORD_AND_OTP && base == AuthMode.PASSWORD_AND_OTP_INLINE) {
                 return AuthMode.PASSWORD_AND_OTP_INLINE;
             }
-            return user.getAuthMode();
+            return assigned;
         }
         return base;
+    }
+
+    /** The authentication mode override of the user's enabled assignment to the requesting client, if any. */
+    private AuthMode assignmentAuthMode(RequestContext context, User user) {
+        if (assignmentService == null || user == null || user.getId() == null || context.clientId() == null) {
+            return null;
+        }
+        return assignmentService.findEnabledRadiusAssignment(user.getId(), context.clientId())
+                .map(a -> a.getAuthMode())
+                .orElse(null);
+    }
+
+    /**
+     * Whether {@code user} may authenticate through the requesting client: it requires an enabled assignment.
+     * Unknown accounts ({@code null}, e.g. directory users without a local account) are never assigned.
+     */
+    private boolean isAssigned(RequestContext context, User user) {
+        return isAssigned(context, user == null ? null : user.getId());
+    }
+
+    private boolean isAssigned(RequestContext context, Long userId) {
+        if (assignmentService == null) {
+            return true;
+        }
+        if (userId == null || context.clientId() == null) {
+            return false;
+        }
+        return assignmentService.findEnabledRadiusAssignment(userId, context.clientId()).isPresent();
+    }
+
+    private byte[] notAssigned(RadiusPacket request, RequestContext context, String userName, Long userId,
+                               String source) {
+        log.warn("RADIUS authentication refused for user '{}' from {} ({}): not assigned to this client",
+                sanitize(userName), context.host(), context.clientName());
+        audit(context, userName, userId, AuthAuditLog.Outcome.FAILURE, "CLIENT_NOT_ASSIGNED", source);
+        return reject(request, context);
     }
 
     private byte[] handleOtpOnlyAuthentication(RadiusPacket request, RequestContext context, String userName,
@@ -293,6 +351,9 @@ public class RadiusAuthenticationHandler {
         User user = verification.user();
         if (!verification.isAuthenticated()) {
             return handleNonAuthenticatedVerification(request, context, userName, verification);
+        }
+        if (!isAssigned(context, user)) {
+            return notAssigned(request, context, userName, user == null ? null : user.getId(), verification.source());
         }
         if (user != null && isUserOrTokenBlocked(user)) {
             log.warn("RADIUS authentication refused for locked-out or disabled user '{}' from {}", safeUser, client);
@@ -345,6 +406,10 @@ public class RadiusAuthenticationHandler {
                 return handleNonAuthenticatedVerification(request, context, userName, verification);
             }
             User user = verification.user();
+            if (!isAssigned(context, user)) {
+                return notAssigned(request, context, userName, user == null ? null : user.getId(),
+                        verification.source());
+            }
             if (isUserOrTokenBlocked(user)) {
                 log.warn("RADIUS authentication refused for locked-out or disabled user '{}' from {}", safeUser, client);
                 audit(context, userName, user.getId(), AuthAuditLog.Outcome.LOCKED, "LOCKED_OUT", verification.source());
@@ -366,6 +431,9 @@ public class RadiusAuthenticationHandler {
             return handleNonAuthenticatedVerification(request, context, userName, verification);
         }
         Long userId = user == null ? null : user.getId();
+        if (!isAssigned(context, user)) {
+            return notAssigned(request, context, userName, userId, verification.source());
+        }
         if (isUserOrTokenBlocked(user)) {
             log.warn("RADIUS authentication refused for locked-out or disabled user '{}' from {}", safeUser, client);
             audit(context, userName, userId, AuthAuditLog.Outcome.LOCKED, "LOCKED_OUT", verification.source());
@@ -463,6 +531,10 @@ public class RadiusAuthenticationHandler {
         User resolvedAccount = credentialVerifier.findLinkedAccount(session.userName())
                 .or(() -> credentialVerifier.findUser(session.userName()))
                 .orElse(null);
+        if (!isAssigned(context, userId)) {
+            // The assignment may have been removed or disabled since the challenge was issued.
+            return notAssigned(request, context, userName, userId, null);
+        }
         if (isUserOrTokenBlocked(userId, resolvedAccount)) {
             log.warn("RADIUS authentication refused for locked-out or disabled user '{}' from {}", safeUser, client);
             audit(context, userName, userId, AuthAuditLog.Outcome.LOCKED, "LOCKED_OUT", null);

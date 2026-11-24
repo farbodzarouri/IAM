@@ -1,7 +1,8 @@
 package com.authprovider.controller;
 
+import com.authprovider.dto.PersonRequest;
+import com.authprovider.dto.PersonResponse;
 import com.authprovider.entity.OtpToken;
-import com.authprovider.entity.Person;
 import com.authprovider.service.OtpProvisioningSupport;
 import com.authprovider.service.PersonService;
 import com.authprovider.service.QrCodeGenerator;
@@ -27,24 +28,31 @@ public class PersonController {
                                          String secret, String otpAuthUri, String qrCode) {
     }
 
-    @GetMapping("/all")
-    public List<Person> getAllPersons() {
-        return personService.getAllPersons();
+    @GetMapping({"", "/all"})
+    public List<PersonResponse> getAllPersons() {
+        return personService.getAllPersons().stream()
+                .map(PersonResponse::from)
+                .toList();
     }
 
     @GetMapping("/{id}")
-    public Person getPersonById(@PathVariable Long id) {
-        return personService.getPersonOrThrow(id);
+    public PersonResponse getPersonById(@PathVariable Long id) {
+        return PersonResponse.from(personService.getPersonOrThrow(id));
     }
 
-    @PostMapping("/create")
-    public Person createPerson(@RequestBody Person person) {
-        return personService.createPerson(person);
+    @PostMapping({"", "/create"})
+    public PersonResponse createPerson(@RequestBody(required = false) PersonRequest request) {
+        return PersonResponse.from(personService.createPerson(request));
     }
 
     @PutMapping("/{id}")
-    public Person updatePerson(@PathVariable Long id, @RequestBody Person person) {
-        return personService.updatePerson(id, person);
+    public PersonResponse updatePerson(@PathVariable Long id, @RequestBody(required = false) PersonRequest request) {
+        return PersonResponse.from(personService.updatePerson(id, request));
+    }
+
+    @DeleteMapping("/{id}")
+    public void deletePerson(@PathVariable Long id) {
+        personService.deletePerson(id);
     }
 
     @GetMapping("/{id}/tokens")

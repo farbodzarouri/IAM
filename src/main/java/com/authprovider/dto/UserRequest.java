@@ -1,11 +1,17 @@
 package com.authprovider.dto;
 
-import com.authprovider.entity.AuthMode;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.List;
+
+/**
+ * User account payload. {@code secret} (optional) is stored in the account's {@link com.authprovider.entity.OtpToken}.
+ * {@code radiusClients} / {@code oauthClients} (optional) replace the user's client assignments when present;
+ * {@code null} leaves them unchanged.
+ */
 @Data
 @Builder
 @NoArgsConstructor
@@ -17,5 +23,6 @@ public class UserRequest {
     private Long personId;
     private Long otpTokenId;
     private Boolean enabled;
-    private AuthMode authMode;
+    private List<ClientAssignmentRequest> radiusClients;
+    private List<ClientAssignmentRequest> oauthClients;
 }

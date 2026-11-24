@@ -56,7 +56,7 @@ public class UserOtpServiceTest {
 
     @Test
     public void testValidateOtpByUsername_Success() {
-        User user = User.builder().id(1L).username("alice").secret("JBSWY3DPEHPK3PXP").build();
+        User user = User.builder().id(1L).username("alice").otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP")).build();
         when(userService.findAllByUsernameIgnoreCase("CORP\\alice")).thenReturn(List.of());
         when(userService.findAllByUsernameIgnoreCase("alice")).thenReturn(List.of(user));
         when(totpService.validateOtp("JBSWY3DPEHPK3PXP", 123456)).thenReturn(true);
@@ -70,7 +70,7 @@ public class UserOtpServiceTest {
 
     @Test
     public void testValidateUserOtp_Success() {
-        User user = User.builder().id(1L).secret("JBSWY3DPEHPK3PXP").build();
+        User user = User.builder().id(1L).otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP")).build();
         when(userService.getUserById(1L)).thenReturn(user);
         when(totpService.validateOtp("JBSWY3DPEHPK3PXP", 123456)).thenReturn(true);
 
@@ -82,7 +82,7 @@ public class UserOtpServiceTest {
 
     @Test
     public void testValidateOcraByUsername_Success() {
-        User user = User.builder().id(1L).username("alice").secret("JBSWY3DPEHPK3PXP").build();
+        User user = User.builder().id(1L).username("alice").otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP")).build();
         when(userService.findAllByUsernameIgnoreCase("alice")).thenReturn(List.of(user));
         when(ocraService.validateOcra("JBSWY3DPEHPK3PXP", "challenge", "654321")).thenReturn(true);
 
@@ -94,7 +94,7 @@ public class UserOtpServiceTest {
 
     @Test
     public void testValidateUserOcra_Success() {
-        User user = User.builder().id(1L).secret("JBSWY3DPEHPK3PXP").build();
+        User user = User.builder().id(1L).otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP")).build();
         when(userService.getUserById(1L)).thenReturn(user);
         when(ocraService.validateOcra("JBSWY3DPEHPK3PXP", "challenge", "654321")).thenReturn(true);
 

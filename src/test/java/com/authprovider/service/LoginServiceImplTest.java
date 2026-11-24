@@ -62,7 +62,7 @@ public class LoginServiceImplTest {
 
     @Test
     void ldapDisabledAuthenticatesLocallyWithTotp() {
-        User user = User.builder().id(1L).username("dave").password("pw").secret(SECRET).build();
+        User user = User.builder().id(1L).username("dave").password("pw").otpToken(com.authprovider.TestUsers.token(SECRET)).build();
         when(userService.findAllByUsernameIgnoreCase("dave")).thenReturn(List.of(user));
         when(totpService.validateOtp(SECRET, 123456)).thenReturn(true);
 
@@ -75,7 +75,7 @@ public class LoginServiceImplTest {
 
     @Test
     void ldapDisabledRejectsWrongLocalPassword() {
-        User user = User.builder().id(1L).username("dave").password("pw").secret(SECRET).build();
+        User user = User.builder().id(1L).username("dave").password("pw").otpToken(com.authprovider.TestUsers.token(SECRET)).build();
         when(userService.findAllByUsernameIgnoreCase("dave")).thenReturn(List.of(user));
 
         assertEquals(LoginResponse.Status.INVALID_CREDENTIALS,
@@ -87,7 +87,7 @@ public class LoginServiceImplTest {
     void fallbackToLocalOnlyForUsersAbsentFromDirectory() {
         properties.setEnabled(true);
         properties.setFallbackToLocal(true);
-        User user = User.builder().id(2L).username("erin").password("pw").secret(SECRET).build();
+        User user = User.builder().id(2L).username("erin").password("pw").otpToken(com.authprovider.TestUsers.token(SECRET)).build();
         when(directoryAuthenticator.authenticate("erin", "pw")).thenReturn(DirectoryAuthenticationResult.userNotFound());
         when(userService.findAllByUsernameIgnoreCase("erin")).thenReturn(List.of(user));
         when(totpService.validateOtp(SECRET, 654321)).thenReturn(true);
@@ -114,7 +114,7 @@ public class LoginServiceImplTest {
     void fallbackRejectsProvisionedAccountsWithoutLocalPassword() {
         properties.setEnabled(true);
         properties.setFallbackToLocal(true);
-        User user = User.builder().id(3L).username("gina").secret(SECRET).build();
+        User user = User.builder().id(3L).username("gina").otpToken(com.authprovider.TestUsers.token(SECRET)).build();
         when(directoryAuthenticator.authenticate("gina", "pw")).thenReturn(DirectoryAuthenticationResult.userNotFound());
         when(userService.findAllByUsernameIgnoreCase("gina")).thenReturn(List.of(user));
 

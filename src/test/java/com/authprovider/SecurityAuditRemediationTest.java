@@ -65,7 +65,7 @@ public class SecurityAuditRemediationTest {
                 .id(999L)
                 .username("auditor")
                 .password("supersecretpassword")
-                .secret("JBSWY3DPEHPK3PXP")
+                .otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP"))
                 .build();
 
         String json = objectMapper.writeValueAsString(user);

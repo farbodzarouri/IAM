@@ -38,10 +38,10 @@ class PersistentStateRestartTest {
         String secret = "JBSWY3DPEHPK3PXP";
         Long userId;
         try (ConfigurableApplicationContext first = start("first-secret")) {
-            userId = first.getBean(UserRepository.class)
-                    .save(User.builder().username("restart-user").password("pw").secret(secret).build()).getId();
-            first.getBean(UserRepository.class)
-                    .save(User.builder().username("approved-user").password("pw").secret(secret).build());
+            userId = first.getBean(com.authprovider.service.UserService.class)
+                    .saveUser(User.builder().username("restart-user").password("pw").otpToken(com.authprovider.TestUsers.token(secret)).build()).getId();
+            first.getBean(com.authprovider.service.UserService.class)
+                    .saveUser(User.builder().username("approved-user").password("pw").otpToken(com.authprovider.TestUsers.token(secret)).build());
             RadiusAuthGuard guard = first.getBean(RadiusAuthGuard.class);
             guard.recordFailure(userId);
             guard.recordFailure(userId);

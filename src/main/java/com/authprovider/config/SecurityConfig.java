@@ -15,6 +15,8 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
 import org.springframework.security.web.authentication.HttpStatusEntryPoint;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
+import org.springframework.security.web.util.matcher.AntPathRequestMatcher;
+import org.springframework.security.web.util.matcher.AnyRequestMatcher;
 
 @Configuration
 @EnableWebSecurity
@@ -55,8 +57,15 @@ public class SecurityConfig {
                         .requestMatchers("/v1/api/otp/validate", "/v1/api/otp/validate-ocra")
                         .hasAuthority("SCOPE_otp:validate")
                         .requestMatchers("/v1/api/mfa/preauth").hasAuthority("SCOPE_mfa:preauth")
-                        // OAuth 2.0 client registry: administrators only.
+                        // Client registries (OAuth 2.0 and the cross-type client listing): administrators only.
+                        .requestMatchers("/v1/api/oauth-clients", "/v1/api/oauth-clients/**").hasRole("ADMIN")
                         .requestMatchers("/v1/api/clients", "/v1/api/clients/**").hasRole("ADMIN")
+                        // User registration & client assignments: administrators only.
+                        .requestMatchers("/v1/api/registration", "/v1/api/registration/**",
+                                "/v1/api/users/register",
+                                "/v1/api/users/*/radius-clients", "/v1/api/users/*/radius-clients/**",
+                                "/v1/api/users/*/oauth-clients", "/v1/api/users/*/oauth-clients/**")
+                        .hasRole("ADMIN")
                         .requestMatchers(
                                 "/v1/api/admin/auth/**",
                                 "/v1/api/setup/**"
@@ -82,9 +91,23 @@ public class SecurityConfig {
                                 "/mfa",
                                 "/error"
                         ).permitAll()
+                        .requestMatchers(
+                                "/v3/api-docs",
+                                "/v3/api-docs/**",
+                                "/swagger-ui.html",
+                                "/swagger-ui/**"
+                        ).hasRole("ADMIN")
                         .anyRequest().authenticated())
                 .exceptionHandling((ex) -> ex
-                        .authenticationEntryPoint(new LoginUrlAuthenticationEntryPoint("/login")))
+                        .defaultAuthenticationEntryPointFor(
+                                new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED),
+                                new AntPathRequestMatcher("/v3/api-docs"))
+                        .defaultAuthenticationEntryPointFor(
+                                new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED),
+                                new AntPathRequestMatcher("/v3/api-docs/**"))
+                        .defaultAuthenticationEntryPointFor(
+                                new LoginUrlAuthenticationEntryPoint("/login"),
+                                AnyRequestMatcher.INSTANCE))
                 .csrf((csrf) -> csrf.ignoringRequestMatchers("/mfa"))
                 .logout((logout) -> logout
                         .logoutUrl("/logout")

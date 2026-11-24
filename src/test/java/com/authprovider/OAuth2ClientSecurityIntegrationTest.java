@@ -102,6 +102,7 @@ class OAuth2ClientSecurityIntegrationTest {
     @Autowired private DatabaseConfigurationBootstrap bootstrap;
     @Autowired private UserService userService;
     @Autowired private UserRepository userRepository;
+    @Autowired private TestClientAssignments assignments;
     @Autowired private AuthFailureRecordRepository failureRepository;
     @Autowired private MfaApprovalRepository approvalRepository;
     @Autowired private RadiusChallengeSessionRepository challengeRepository;
@@ -157,7 +158,7 @@ class OAuth2ClientSecurityIntegrationTest {
         if (arr != null && arr.isArray()) {
             for (JsonNode c : arr) {
                 if (c.hasNonNull("id")) {
-                    mvc.perform(delete("/v1/api/clients/" + c.get("id").asLong()).with(adminUser()));
+                    mvc.perform(delete("/v1/api/oauth-clients/" + c.get("id").asLong()).with(adminUser()));
                 }
             }
         }
@@ -198,12 +199,11 @@ class OAuth2ClientSecurityIntegrationTest {
     }
 
     private User createUser(String username, String password, String secret, AuthMode authMode) {
-        return userService.saveUser(User.builder()
+        return assignments.authMode(userService.saveUser(User.builder()
                 .username(username)
                 .password(password)
-                .secret(secret)
-                .authMode(authMode)
-                .build());
+                .otpToken(com.authprovider.TestUsers.token(secret))
+                .build()), authMode);
     }
 
     private String distinctSecret(long step) {
@@ -295,14 +295,14 @@ class OAuth2ClientSecurityIntegrationTest {
 
     private MvcResult createClientRaw(MockMvc mvc, ObjectNode payload) throws Exception {
         String json = JSON.writeValueAsString(payload);
-        MvcResult res = mvc.perform(post("/v1/api/clients/create")
+        MvcResult res = mvc.perform(post("/v1/api/oauth-clients/create")
                         .with(adminUser())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(json))
                 .andReturn();
         int status = res.getResponse().getStatus();
         if (status == 404 || status == 405) {
-            res = mvc.perform(post("/v1/api/clients")
+            res = mvc.perform(post("/v1/api/oauth-clients")
                             .with(adminUser())
                             .contentType(MediaType.APPLICATION_JSON)
                             .content(json))
@@ -328,20 +328,20 @@ class OAuth2ClientSecurityIntegrationTest {
     }
 
     private MvcResult getClientsRaw(MockMvc mvc) throws Exception {
-        MvcResult res = mvc.perform(get("/v1/api/clients/all").with(adminUser())).andReturn();
+        MvcResult res = mvc.perform(get("/v1/api/oauth-clients/all").with(adminUser())).andReturn();
         int status = res.getResponse().getStatus();
         if (status == 404 || status == 405) {
-            res = mvc.perform(get("/v1/api/clients").with(adminUser())).andReturn();
+            res = mvc.perform(get("/v1/api/oauth-clients").with(adminUser())).andReturn();
         }
         return res;
     }
 
     private MvcResult getClientRaw(MockMvc mvc, long id) throws Exception {
-        return mvc.perform(get("/v1/api/clients/" + id).with(adminUser())).andReturn();
+        return mvc.perform(get("/v1/api/oauth-clients/" + id).with(adminUser())).andReturn();
     }
 
     private MvcResult updateClientRaw(MockMvc mvc, long id, ObjectNode payload) throws Exception {
-        return mvc.perform(put("/v1/api/clients/" + id)
+        return mvc.perform(put("/v1/api/oauth-clients/" + id)
                         .with(adminUser())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(JSON.writeValueAsString(payload)))
@@ -368,7 +368,7 @@ class OAuth2ClientSecurityIntegrationTest {
     }
 
     private MvcResult deleteClientRaw(MockMvc mvc, long id) throws Exception {
-        return mvc.perform(delete("/v1/api/clients/" + id).with(adminUser())).andReturn();
+        return mvc.perform(delete("/v1/api/oauth-clients/" + id).with(adminUser())).andReturn();
     }
 
     private MvcResult requestTokenRaw(MockMvc mvc, String basicHeader, String grantType, String scope) throws Exception {
@@ -386,6 +386,7 @@ class OAuth2ClientSecurityIntegrationTest {
     }
 
     private String issueToken(MockMvc mvc, String clientId, String secret, String scope) throws Exception {
+        assignments.assignAll();
         MvcResult res = requestTokenRaw(mvc, basicAuth(clientId, secret), "client_credentials", scope);
         assertEquals(200, res.getResponse().getStatus(),
                 "Expected 200 from /oauth2/token for " + clientId + ", got " + res.getResponse().getStatus()
@@ -866,18 +867,18 @@ class OAuth2ClientSecurityIntegrationTest {
         String token = issueToken("full-scope-client", sec, null);
 
         // Unauthenticated client management API returns 4xx
-        int unauthClients = mockMvc.perform(get("/v1/api/clients/all")).andReturn().getResponse().getStatus();
+        int unauthClients = mockMvc.perform(get("/v1/api/oauth-clients/all")).andReturn().getResponse().getStatus();
         if (unauthClients == 404 || unauthClients == 405) {
-            unauthClients = mockMvc.perform(get("/v1/api/clients")).andReturn().getResponse().getStatus();
+            unauthClients = mockMvc.perform(get("/v1/api/oauth-clients")).andReturn().getResponse().getStatus();
         }
         assertRejected4xx(unauthClients, "Unauthenticated request to client list route");
 
         // OAuth2 client Bearer token must be rejected (4xx) on all protected admin routes
-        int bearerListStatus = mockMvc.perform(get("/v1/api/clients/all")
+        int bearerListStatus = mockMvc.perform(get("/v1/api/oauth-clients/all")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
                 .andReturn().getResponse().getStatus();
         if (bearerListStatus == 404 || bearerListStatus == 405) {
-            bearerListStatus = mockMvc.perform(get("/v1/api/clients")
+            bearerListStatus = mockMvc.perform(get("/v1/api/oauth-clients")
                             .header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
                     .andReturn().getResponse().getStatus();
         }
@@ -885,13 +886,13 @@ class OAuth2ClientSecurityIntegrationTest {
 
         String escalatedPayload = JSON.writeValueAsString(clientPayload(
                 null, "escalated", clientSecret("esc"), "Esc", true, false, null, ALL_SCOPES));
-        int bearerCreateStatus = mockMvc.perform(post("/v1/api/clients/create")
+        int bearerCreateStatus = mockMvc.perform(post("/v1/api/oauth-clients/create")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(escalatedPayload))
                 .andReturn().getResponse().getStatus();
         if (bearerCreateStatus == 404 || bearerCreateStatus == 405) {
-            bearerCreateStatus = mockMvc.perform(post("/v1/api/clients")
+            bearerCreateStatus = mockMvc.perform(post("/v1/api/oauth-clients")
                             .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                             .contentType(MediaType.APPLICATION_JSON)
                             .content(escalatedPayload))
@@ -1414,7 +1415,7 @@ class OAuth2ClientSecurityIntegrationTest {
                 "client_credentials", null).getResponse().getStatus(),
                 "Locked-out client prior to unblock on /oauth2/token");
 
-        // Setting blocked=false via PUT /v1/api/clients/{id} must clear active brute-force lockout
+        // Setting blocked=false via PUT /v1/api/oauth-clients/{id} must clear active brute-force lockout
         updateClient(mockMvc, pk, "unblock-client", null, "Unblocked",
                 true, false, null, List.of(SCOPE_OTP_VALIDATE));
 
@@ -1556,12 +1557,12 @@ class OAuth2ClientSecurityIntegrationTest {
             node1.getBean(UserService.class).saveUser(User.builder()
                     .username("cluster-u1")
                     .password(USER_PASS)
-                    .secret(userSecret)
+                    .otpToken(com.authprovider.TestUsers.token(userSecret))
                     .build());
             isolatedNode.getBean(UserService.class).saveUser(User.builder()
                     .username("cluster-u1")
                     .password(USER_PASS)
-                    .secret(userSecret)
+                    .otpToken(com.authprovider.TestUsers.token(userSecret))
                     .build());
 
             String cSec1 = clientSecret("cluster-1");
@@ -1569,6 +1570,8 @@ class OAuth2ClientSecurityIntegrationTest {
             JsonNode client = createClient(mvc1, "cluster-client", cSec1, "Cluster Gateway",
                     true, false, null, List.of(SCOPE_OTP_VALIDATE));
             long clientPk = client.get("id").asLong();
+            node1.getBean(TestClientAssignments.class).assignAll();
+            isolatedNode.getBean(TestClientAssignments.class).assignAll();
 
             // Token minted on node1 verifies against node2 JWKS, works on node2, and is rejected on isolatedNode
             String t1 = issueToken(mvc1, "cluster-client", cSec1, null);

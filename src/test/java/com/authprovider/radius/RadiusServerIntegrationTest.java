@@ -46,13 +46,19 @@ class RadiusServerIntegrationTest {
     @Autowired
     private UserRepository userRepository;
 
+    @Autowired
+    private com.authprovider.service.UserService userService;
+
+    @Autowired
+    private com.authprovider.TestClientAssignments assignments;
+
     private final TotpServiceImpl totp = new TotpServiceImpl();
     private User user;
 
     @BeforeEach
     void setUp() {
         String name = "rdguser" + RANDOM.nextInt(1_000_000);
-        user = userRepository.save(User.builder().username(name).secret("JBSWY3DPEHPK3PXP").build());
+        user = userService.saveUser(User.builder().username(name).otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP")).build());
     }
 
     private String preauthJson(String username, int otp) {
@@ -82,6 +88,7 @@ class RadiusServerIntegrationTest {
     }
 
     private byte[] send(DatagramSocket socket, byte[] packet) throws Exception {
+        assignments.assignAll();
         socket.send(new DatagramPacket(packet, packet.length, InetAddress.getLoopbackAddress(), radiusServer.getLocalPort()));
         byte[] buf = new byte[4096];
         DatagramPacket resp = new DatagramPacket(buf, buf.length);

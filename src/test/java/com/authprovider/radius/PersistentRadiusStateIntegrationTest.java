@@ -51,6 +51,8 @@ class PersistentRadiusStateIntegrationTest {
     private static final String SECRET = "JBSWY3DPEHPK3PXP";
 
     @Autowired private RadiusServer radiusServer;
+
+    @Autowired private com.authprovider.TestClientAssignments assignments;
     @Autowired private UserRepository userRepository;
     @Autowired private TotpService totpService;
     @Autowired private UserService userService;
@@ -77,7 +79,8 @@ class PersistentRadiusStateIntegrationTest {
         failureRepository.deleteAll();
         approvalRepository.deleteAll();
         userRepository.deleteAll();
-        user = userRepository.save(User.builder().username("persist-user").password(PASSWORD).secret(SECRET).build());
+        user = userService.saveUser(User.builder().username("persist-user").password(PASSWORD).otpToken(com.authprovider.TestUsers.token(SECRET)).build());
+        assignments.assignAll();
     }
 
     @AfterEach
@@ -109,6 +112,7 @@ class PersistentRadiusStateIntegrationTest {
     @Test
     void challengeSessionIsPersistedAndSingleUse() throws Exception {
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "persist-secret")) {
+            assignments.assignAll();
             RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("persist-user", PASSWORD, null));
             assertEquals(ACCESS_CHALLENGE, challenge.getCode());
             assertEquals(33, challenge.getAttribute(ATTR_SESSION_TIMEOUT).orElseThrow().getValueAsInteger());
@@ -116,8 +120,10 @@ class PersistentRadiusStateIntegrationTest {
             byte[] state = challenge.getAttribute(ATTR_STATE).orElseThrow().getValue();
 
             String otp = String.format("%06d", totpService.generateOtp(SECRET));
+            assignments.assignAll();
             assertEquals(ACCESS_ACCEPT, client.sendExpectingResponse(client.accessRequest("persist-user", otp, state)).getCode());
             assertEquals(0, challengeRepository.count());
+            assignments.assignAll();
             assertEquals(ACCESS_REJECT, client.sendExpectingResponse(client.accessRequest("persist-user", otp, state)).getCode());
         }
         List<AuthAuditLog> audit = auditRepository.findByUsernameOrderByIdAsc("persist-user");
@@ -131,11 +137,13 @@ class PersistentRadiusStateIntegrationTest {
     void dedicatedClientSecretIsResolvedFromSenderAddress() throws Exception {
         clientRepository.save(RadiusClient.builder().name("loopback-subnet").address("127.0.0.0/8")
                 .sharedSecret("subnet-secret").active(true).build());
+        assignments.assignAll();
         try (RadiusTestClient subnet = new RadiusTestClient(radiusServer.getLocalPort(), "subnet-secret");
              RadiusTestClient legacy = new RadiusTestClient(radiusServer.getLocalPort(), "persist-secret")) {
             assertEquals(ACCESS_CHALLENGE,
                     subnet.sendExpectingResponse(subnet.accessRequest("persist-user", PASSWORD, null)).getCode());
             // The global secret no longer validates packets from this (more specific) subnet.
+            assignments.assignAll();
             assertTrue(legacy.send(legacy.accessRequest("persist-user", PASSWORD, null)).isEmpty());
 
             clientRepository.save(RadiusClient.builder().name("loopback-host").address("127.0.0.1")
@@ -147,6 +155,7 @@ class PersistentRadiusStateIntegrationTest {
             RadiusClient host = clientRepository.findByName("loopback-host").orElseThrow();
             host.setActive(true);
             clientRepository.save(host);
+            assignments.assignAll();
             try (RadiusTestClient hostClient = new RadiusTestClient(radiusServer.getLocalPort(), "host-secret")) {
                 assertEquals(ACCESS_CHALLENGE,
                         hostClient.sendExpectingResponse(hostClient.accessRequest("persist-user", PASSWORD, null)).getCode());
@@ -161,6 +170,7 @@ class PersistentRadiusStateIntegrationTest {
             clientRepository.save(c);
         });
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "persist-secret")) {
+            assignments.assignAll();
             assertTrue(client.send(client.accessRequest("persist-user", PASSWORD, null)).isEmpty());
         } finally {
             clientRepository.findAll().forEach(c -> {
@@ -199,6 +209,7 @@ class PersistentRadiusStateIntegrationTest {
         policy.setMaxFailures(1);
         policyRepository.save(policy);
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "persist-secret")) {
+            assignments.assignAll();
             client.sendExpectingResponse(client.accessRequest("persist-user", "wrong", null));
             assertEquals(ACCESS_REJECT,
                     client.sendExpectingResponse(client.accessRequest("persist-user", PASSWORD, null)).getCode());

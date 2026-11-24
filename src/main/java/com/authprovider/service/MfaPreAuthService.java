@@ -15,6 +15,14 @@ public interface MfaPreAuthService {
     boolean preAuthenticate(String username, Integer otp);
 
     /**
+     * Pre-authenticates on behalf of the OAuth 2.0 client {@code oauthClientId} (database id): the user must
+     * hold an enabled assignment to that client. {@code null} pre-authenticates without a client context.
+     */
+    default boolean preAuthenticate(String username, Integer otp, Long oauthClientId) {
+        return preAuthenticate(username, otp);
+    }
+
+    /**
      * Atomically consumes a pending, non-expired approval for the given (RADIUS) user name.
      *
      * @return true if an approval existed and has now been consumed

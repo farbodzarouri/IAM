@@ -30,6 +30,16 @@ public class OtpControllerTest {
     @MockBean
     private UserService userService;
 
+    @MockBean
+    private com.authprovider.service.UserClientAssignmentService assignmentService;
+
+    @org.junit.jupiter.api.BeforeEach
+    void assignMockedUsersToEveryClient() {
+        // The mocked users hold an enabled assignment to the calling OAuth client.
+        when(assignmentService.findEnabledOAuthAssignment(any(), any()))
+                .thenReturn(java.util.Optional.of(com.authprovider.entity.UserOAuthClient.builder().build()));
+    }
+
     @Test
     @WithMockUser
     public void testGenerateSecretByUsername() throws Exception {

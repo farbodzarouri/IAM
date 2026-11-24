@@ -51,6 +51,7 @@ class OAuth2ClientCredentialsIntegrationTest {
     @Autowired private OAuthClientRepository clientRepository;
     @Autowired private AuthAuditLogRepository auditRepository;
     @Autowired private UserService userService;
+    @Autowired private com.authprovider.TestClientAssignments assignments;
 
     private record Registered(long id, String clientId, String secret) {
     }
@@ -69,7 +70,7 @@ class OAuth2ClientCredentialsIntegrationTest {
         String clientId = "sys-" + UUID.randomUUID();
         String body = "{\"clientId\":\"" + clientId + "\",\"name\":\"Connected system\",\"scopes\":" + scopesJson
                 + (authMode == null ? "" : ",\"authMode\":\"" + authMode + "\"") + "}";
-        JsonNode json = json(mockMvc.perform(asAdmin(post("/v1/api/clients/create"))
+        JsonNode json = json(mockMvc.perform(asAdmin(post("/v1/api/oauth-clients/create"))
                         .contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isOk())
                 .andExpect(header().string(HttpHeaders.CACHE_CONTROL, "no-store"))
@@ -99,6 +100,7 @@ class OAuth2ClientCredentialsIntegrationTest {
     }
 
     private String token(Registered client, String scope) throws Exception {
+        assignments.assignAll();
         String form = "grant_type=client_credentials" + (scope == null ? "" : "&scope=" + URLEncoder.encode(scope,
                 StandardCharsets.UTF_8));
         return json(tokenRequest(client.clientId(), client.secret(), form)
@@ -131,7 +133,7 @@ class OAuth2ClientCredentialsIntegrationTest {
     }
 
     private ResultActions updateClient(long id, String body) throws Exception {
-        return mockMvc.perform(asAdmin(put("/v1/api/clients/" + id))
+        return mockMvc.perform(asAdmin(put("/v1/api/oauth-clients/" + id))
                 .contentType(MediaType.APPLICATION_JSON).content(body));
     }
 
@@ -147,23 +149,23 @@ class OAuth2ClientCredentialsIntegrationTest {
 
     @Test
     void clientRegistryRequiresAdministratorAndNeverExposesSecretHash() throws Exception {
-        mockMvc.perform(get("/v1/api/clients/all")).andExpect(status().isUnauthorized());
-        mockMvc.perform(get("/v1/api/clients/all").with(user("operator").roles("USER")))
+        mockMvc.perform(get("/v1/api/oauth-clients/all")).andExpect(status().isUnauthorized());
+        mockMvc.perform(get("/v1/api/oauth-clients/all").with(user("operator").roles("USER")))
                 .andExpect(status().isForbidden());
 
         Registered client = register("[\"otp:validate\"]");
         String bearer = token(client, null);
-        mockMvc.perform(get("/v1/api/clients/all").header(HttpHeaders.AUTHORIZATION, "Bearer " + bearer))
+        mockMvc.perform(get("/v1/api/oauth-clients/all").header(HttpHeaders.AUTHORIZATION, "Bearer " + bearer))
                 .andExpect(status().isUnauthorized());
 
-        String listing = mockMvc.perform(asAdmin(get("/v1/api/clients/all")))
+        String listing = mockMvc.perform(asAdmin(get("/v1/api/oauth-clients/all")))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();
         assertTrue(listing.contains(client.clientId()));
         assertFalse(listing.contains(client.secret()));
         assertFalse(listing.contains("$2a$"));
 
-        mockMvc.perform(asAdmin(get("/v1/api/clients/" + client.id())))
+        mockMvc.perform(asAdmin(get("/v1/api/oauth-clients/" + client.id())))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.clientSecret").doesNotExist())
                 .andExpect(jsonPath("$.scopes[0]").value("otp:validate"));
@@ -171,18 +173,18 @@ class OAuth2ClientCredentialsIntegrationTest {
         String stored = clientRepository.findById(client.id()).orElseThrow().getClientSecretHash();
         assertTrue(stored.startsWith("$2"), "client secrets must be stored as BCrypt hashes");
 
-        mockMvc.perform(asAdmin(post("/v1/api/clients/create")).contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(asAdmin(post("/v1/api/oauth-clients/create")).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"clientId\":\"" + client.clientId() + "\",\"scopes\":[\"otp:validate\"]}"))
                 .andExpect(status().isConflict());
-        mockMvc.perform(asAdmin(post("/v1/api/clients/create")).contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(asAdmin(post("/v1/api/oauth-clients/create")).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"clientId\":\"bad-scope-client\",\"scopes\":[\"admin:all\"]}"))
                 .andExpect(status().isBadRequest());
-        mockMvc.perform(asAdmin(post("/v1/api/clients/create")).contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(asAdmin(post("/v1/api/oauth-clients/create")).contentType(MediaType.APPLICATION_JSON)
                         .content("{\"clientId\":\"no-scope-client\"}"))
                 .andExpect(status().isBadRequest());
-        mockMvc.perform(asAdmin(get("/v1/api/clients/999999"))).andExpect(status().isNotFound());
+        mockMvc.perform(asAdmin(get("/v1/api/oauth-clients/999999"))).andExpect(status().isNotFound());
 
-        mockMvc.perform(asAdmin(delete("/v1/api/clients/" + client.id()))).andExpect(status().isOk());
+        mockMvc.perform(asAdmin(delete("/v1/api/oauth-clients/" + client.id()))).andExpect(status().isOk());
         validateOtp(bearer).andExpect(status().isUnauthorized());
         tokenRequest(client.clientId(), client.secret(), "grant_type=client_credentials")
                 .andExpect(status().isUnauthorized());
@@ -474,7 +476,7 @@ class OAuth2ClientCredentialsIntegrationTest {
                 .andExpect(jsonPath("$.blocked").value(false));
         token(current, null);
 
-        JsonNode generated = json(mockMvc.perform(asAdmin(post("/v1/api/clients/" + client.id() + "/rotate-secret")))
+        JsonNode generated = json(mockMvc.perform(asAdmin(post("/v1/api/oauth-clients/" + client.id() + "/rotate-secret")))
                 .andExpect(status().isOk()).andReturn());
         String newSecret = generated.get("clientSecret").asText();
         tokenRequest(current.clientId(), current.secret(), "grant_type=client_credentials")
@@ -501,7 +503,7 @@ class OAuth2ClientCredentialsIntegrationTest {
                 .andExpect(jsonPath("$.error").value("invalid_client"));
         introspect(client, "x").andExpect(status().isUnauthorized());
 
-        mockMvc.perform(asAdmin(get("/v1/api/clients/" + client.id())))
+        mockMvc.perform(asAdmin(get("/v1/api/oauth-clients/" + client.id())))
                 .andExpect(jsonPath("$.blocked").value(false))
                 .andExpect(jsonPath("$.locked").value(true))
                 .andExpect(jsonPath("$.lockedUntil").exists());
@@ -523,7 +525,7 @@ class OAuth2ClientCredentialsIntegrationTest {
     void clientAuthModeOverrideAppliesToRestLogin() throws Exception {
         String username = "m2m-user-" + UUID.randomUUID().toString().substring(0, 8);
         User user = userService.saveUser(User.builder().username(username).password(USER_PASS)
-                .secret("JBSWY3DPEHPK3PXP").build());
+                .otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP")).build());
         assertNotNull(user.getId());
         String body = "{\"username\":\"" + username + "\",\"password\":\"" + USER_PASS + "\"}";
 

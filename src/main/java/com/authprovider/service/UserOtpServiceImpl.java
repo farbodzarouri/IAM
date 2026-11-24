@@ -2,6 +2,7 @@ package com.authprovider.service;
 
 import com.authprovider.dto.OtpValidationResponse;
 import com.authprovider.entity.AuthAuditLog;
+import com.authprovider.entity.OtpToken;
 import com.authprovider.entity.User;
 import com.authprovider.exception.BadRequestException;
 import com.authprovider.exception.ConflictException;
@@ -29,6 +30,7 @@ public class UserOtpServiceImpl implements UserOtpService {
     private final AccountResolver<User> accountResolver;
     private final SecurityPolicyService policyService;
     private final AuthAuditService auditService;
+    private UserClientAssignmentService assignmentService;
 
     @Autowired
     public UserOtpServiceImpl(UserService userService,
@@ -46,6 +48,11 @@ public class UserOtpServiceImpl implements UserOtpService {
         this.accountResolver = AccountResolver.of(userService);
         this.policyService = policyService == null ? SecurityPolicyService.withDefaults() : policyService;
         this.auditService = auditService == null ? AuthAuditService.noOp() : auditService;
+    }
+
+    @Autowired(required = false)
+    public void setAssignmentService(UserClientAssignmentService assignmentService) {
+        this.assignmentService = assignmentService;
     }
 
     @Override
@@ -78,8 +85,11 @@ public class UserOtpServiceImpl implements UserOtpService {
 
     private String provisionNewSecret(User user) {
         String secret = secretGenerator.generateSecret();
-        user.setSecret(secret);
-        userService.saveUser(user);
+        user.setOtpToken(withSecret(user.getOtpToken(), secret));
+        User saved = userService.saveUser(user);
+        if (saved != null && saved.getOtpToken() != null) {
+            user.setOtpToken(saved.getOtpToken());
+        }
         Long userId = user.getId();
         if (userId != null) {
             otpVerifier.lockoutService().invalidatePendingSessions(userId);
@@ -91,8 +101,33 @@ public class UserOtpServiceImpl implements UserOtpService {
         return secret;
     }
 
+    /**
+     * Returns a token carrying {@code secret}: a detached copy of {@code existing} (same id, so the secret of
+     * the bound token is replaced when the account is saved) or a new, enabled token when none is bound.
+     * OTP secrets are only ever stored in {@link OtpToken}.
+     */
+    static OtpToken withSecret(OtpToken existing, String secret) {
+        if (existing == null) {
+            return OtpToken.builder().secret(secret).enabled(true).build();
+        }
+        return OtpToken.builder()
+                .id(existing.getId())
+                .person(existing.getPerson())
+                .label(existing.getLabel())
+                .secret(secret)
+                .enabled(existing.isEnabled())
+                .createdAt(existing.getCreatedAt())
+                .updatedAt(existing.getUpdatedAt())
+                .build();
+    }
+
     @Override
     public OtpValidationResponse validateOtpByUsername(String username, String otp) {
+        return validateOtpByUsername(username, otp, null);
+    }
+
+    @Override
+    public OtpValidationResponse validateOtpByUsername(String username, String otp, Long oauthClientId) {
         String trimmedUser = username == null ? "" : username.trim();
         String trimmedOtp = otp == null ? "" : otp.trim();
         if (trimmedUser.isEmpty() || !OTP_PATTERN.matcher(trimmedOtp).matches()) {
@@ -109,12 +144,22 @@ public class UserOtpServiceImpl implements UserOtpService {
             return OtpValidationResponse.invalidOtp(trimmedUser);
         }
         User user = resolution.user();
+        if (!isAssigned(user, oauthClientId)) {
+            audit(user.getUsername(), user.getId(), AuthAuditLog.Outcome.FAILURE, "CLIENT_NOT_ASSIGNED");
+            return OtpValidationResponse.invalidOtp(trimmedUser);
+        }
         OtpVerificationService.Result result = otpVerifier.verifyTotp(user, Integer.parseInt(trimmedOtp), false);
         return toResponseAndAudit(user, trimmedUser, result);
     }
 
     @Override
     public OtpValidationResponse validateOcraByUsername(String username, String challenge, String otp) {
+        return validateOcraByUsername(username, challenge, otp, null);
+    }
+
+    @Override
+    public OtpValidationResponse validateOcraByUsername(String username, String challenge, String otp,
+                                                        Long oauthClientId) {
         String trimmedUser = username == null ? "" : username.trim();
         String trimmedChallenge = challenge == null ? "" : challenge.trim();
         String trimmedOtp = otp == null ? "" : otp.trim();
@@ -132,8 +177,26 @@ public class UserOtpServiceImpl implements UserOtpService {
             return OtpValidationResponse.invalidOtp(trimmedUser);
         }
         User user = resolution.user();
+        if (!isAssigned(user, oauthClientId)) {
+            audit(user.getUsername(), user.getId(), AuthAuditLog.Outcome.FAILURE, "CLIENT_NOT_ASSIGNED");
+            return OtpValidationResponse.invalidOtp(trimmedUser);
+        }
         OtpVerificationService.Result result = otpVerifier.verifyOcra(user, trimmedChallenge, trimmedOtp);
         return toResponseAndAudit(user, trimmedUser, result);
+    }
+
+    /**
+     * Whether {@code user} may validate through the OAuth 2.0 client {@code oauthClientId}: it requires an
+     * enabled assignment. Without a client context ({@code null}) no assignment is required.
+     */
+    private boolean isAssigned(User user, Long oauthClientId) {
+        if (oauthClientId == null) {
+            return true;
+        }
+        if (assignmentService == null || user == null || user.getId() == null) {
+            return false;
+        }
+        return assignmentService.findEnabledOAuthAssignment(user.getId(), oauthClientId).isPresent();
     }
 
     private OtpValidationResponse toResponseAndAudit(User user, String submittedUsername,

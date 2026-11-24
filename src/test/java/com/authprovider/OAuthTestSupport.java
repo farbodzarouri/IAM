@@ -43,9 +43,30 @@ public final class OAuthTestSupport {
         };
     }
 
+    /**
+     * Bearer token of a dedicated client <em>without</em> assigning any user to it (users need an enabled
+     * assignment to the client to authenticate through it).
+     */
+    public static RequestPostProcessor bearerWithoutAssignments(String clientId, AuthMode authMode,
+                                                                Set<ClientScope> scopes) {
+        return request -> {
+            ApplicationContext context = WebApplicationContextUtils
+                    .getRequiredWebApplicationContext(request.getServletContext());
+            OAuthClient client = ensureClient(context, clientId, authMode, scopes);
+            request.addHeader(HttpHeaders.AUTHORIZATION, "Bearer "
+                    + context.getBean(AccessTokenService.class).issue(client, scopes).value());
+            return request;
+        };
+    }
+
+    /**
+     * Issues a token for the client. Every existing user without an assignment to a client is assigned to it
+     * (enabled, inheriting the client mode), so tests not concerned with assignments can authenticate.
+     */
     public static String issueToken(ApplicationContext context, String clientId, AuthMode authMode,
                                     Set<ClientScope> scopes) {
         OAuthClient client = ensureClient(context, clientId, authMode, scopes);
+        context.getBean(TestClientAssignments.class).assignAll();
         return context.getBean(AccessTokenService.class).issue(client, scopes).value();
     }
 

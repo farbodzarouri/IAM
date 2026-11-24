@@ -59,6 +59,12 @@ public class RadiusLdapFederationTest {
     private UserRepository userRepository;
 
     @Autowired
+    private com.authprovider.TestClientAssignments assignments;
+
+    @Autowired
+    private com.authprovider.service.UserService userService;
+
+    @Autowired
     private SecretGenerator secretGenerator;
 
     @Autowired
@@ -95,9 +101,9 @@ public class RadiusLdapFederationTest {
         enrolledBob = User.builder()
                 .username("bob")
                 .password("LocalBobHashPass123!")
-                .secret(secretGenerator.generateSecret())
+                .otpToken(com.authprovider.TestUsers.token(secretGenerator.generateSecret()))
                 .build();
-        userRepository.save(enrolledBob);
+        enrolledBob = userService.saveUser(enrolledBob);
 
         // alice is in LDAP (Password123!) but is UNENROLLED (not in local DB)
     }
@@ -359,6 +365,7 @@ public class RadiusLdapFederationTest {
     }
 
     private byte[] sendRadiusPacket(byte[] requestBytes, int timeoutMs) throws IOException {
+        assignments.assignAll();
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setSoTimeout(timeoutMs);
             DatagramPacket req = new DatagramPacket(

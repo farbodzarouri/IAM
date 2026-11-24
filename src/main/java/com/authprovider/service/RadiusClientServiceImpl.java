@@ -6,7 +6,9 @@ import com.authprovider.exception.ConflictException;
 import com.authprovider.exception.ResourceNotFoundException;
 import com.authprovider.radius.CidrBlock;
 import com.authprovider.repository.RadiusClientRepository;
+import com.authprovider.repository.UserRadiusClientRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,6 +23,12 @@ import java.util.Objects;
 public class RadiusClientServiceImpl implements RadiusClientService {
 
     private final RadiusClientRepository repository;
+    private UserRadiusClientRepository radiusAssignmentRepository;
+
+    @Autowired(required = false)
+    public void setRadiusAssignmentRepository(UserRadiusClientRepository radiusAssignmentRepository) {
+        this.radiusAssignmentRepository = radiusAssignmentRepository;
+    }
 
     @Override
     public List<RadiusClient> getAllClients() {
@@ -82,6 +90,9 @@ public class RadiusClientServiceImpl implements RadiusClientService {
     @Transactional
     public void deleteClient(Long id) {
         RadiusClient existing = getClientOrThrow(id);
+        if (radiusAssignmentRepository != null) {
+            radiusAssignmentRepository.deleteByClientId(id);
+        }
         repository.delete(existing);
     }
 

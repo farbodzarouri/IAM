@@ -51,6 +51,7 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
     private final AuthAuditService auditService;
     private final OtpVerificationService otpVerifier;
     private final AccountLockoutService lockoutService;
+    private UserClientAssignmentService assignmentService;
 
     /** In-memory approvals (only used without a repository): normalized username -> approval. */
     private final Map<String, PendingApproval> approvals = new ConcurrentHashMap<>();
@@ -102,8 +103,37 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
         return Duration.ofSeconds(policyService.current().getMfaApprovalTtlSeconds());
     }
 
+    @Autowired(required = false)
+    public void setAssignmentService(UserClientAssignmentService assignmentService) {
+        this.assignmentService = assignmentService;
+    }
+
     @Override
     public boolean preAuthenticate(String username, Integer otp) {
+        return doPreAuthenticate(username, otp, null);
+    }
+
+    @Override
+    public boolean preAuthenticate(String username, Integer otp, Long oauthClientId) {
+        return doPreAuthenticate(username, otp, oauthClientId);
+    }
+
+    /**
+     * Whether {@code user} may pre-authenticate through the OAuth 2.0 client {@code oauthClientId}: it requires
+     * an enabled assignment. Without a client context ({@code null}, e.g. the self-service web form) no
+     * assignment is required here; RADIUS enforces its own client assignment when consuming the approval.
+     */
+    private boolean isAssigned(User user, Long oauthClientId) {
+        if (oauthClientId == null) {
+            return true;
+        }
+        if (assignmentService == null || user == null || user.getId() == null) {
+            return false;
+        }
+        return assignmentService.findEnabledOAuthAssignment(user.getId(), oauthClientId).isPresent();
+    }
+
+    private boolean doPreAuthenticate(String username, Integer otp, Long oauthClientId) {
         String normalized = UsernameNormalizer.normalize(username);
         if (normalized == null || otp == null || otp < 0) {
             audit(AuthAuditLog.Outcome.FAILURE, username, null, "INVALID_REQUEST");
@@ -123,6 +153,12 @@ public class MfaPreAuthServiceImpl implements MfaPreAuthService {
             }
         } else {
             key = "unknown:" + username.trim().toLowerCase(java.util.Locale.ROOT);
+        }
+
+        if (user != null && !isAssigned(user, oauthClientId)) {
+            log.warn("MFA pre-authentication rejected for user '{}': not assigned to the calling client", key);
+            audit(AuthAuditLog.Outcome.FAILURE, key, user.getId(), "CLIENT_NOT_ASSIGNED");
+            return false;
         }
 
         Optional<Instant> mfaLockedUntil = lockedUntil(key, now, policy);

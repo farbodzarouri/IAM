@@ -14,7 +14,6 @@ import com.authprovider.service.SecurityPolicyService;
 import com.authprovider.service.UsernameNormalizer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.IncorrectResultSizeDataAccessException;
 import org.springframework.stereotype.Component;
 
@@ -36,7 +35,6 @@ public class PrimaryCredentialVerifier {
     private final SecurityPolicyService policyService;
     private final PasswordService passwordService;
     private final AccountResolver<User> accountResolver;
-    private final Object provisioningLock = new Object();
 
     public enum Outcome {
         AUTHENTICATED,
@@ -104,8 +102,8 @@ public class PrimaryCredentialVerifier {
 
     /**
      * Verifies the primary credentials of a RADIUS user. When {@code requireEnrollment} is {@code false}
-     * (password-only authentication), accounts without an enrolled OTP secret are permitted and LDAP-only
-     * accounts can be auto-provisioned when configured.
+     * (password-only authentication), existing accounts without an enrolled OTP secret are permitted.
+     * RADIUS never auto-provisions local accounts from a directory.
      */
     public Verification verify(String userName, byte[] password, Predicate<Long> isLocked, boolean requireEnrollment) {
         Optional<User> localUser = findUser(userName);
@@ -169,14 +167,9 @@ public class PrimaryCredentialVerifier {
                         ? result.username() : loginName;
                 Optional<User> linked = findLinkedAccount(canonical);
                 if (linked.isEmpty()) {
-                    if (!requireEnrollment && directoryConfiguration.isAutoProvision(result)) {
-                        linked = provisionPasswordOnlyDirectoryUser(canonical);
-                    }
-                    if (linked.isEmpty()) {
-                        log.warn("Directory user '{}' has no enrolled local account; complete two-factor enrollment "
-                                + "before using RADIUS", RadiusAuthenticationHandler.sanitize(canonical));
-                        return new Verification(Outcome.NOT_ENROLLED, null, SOURCE_DIRECTORY);
-                    }
+                    log.warn("Directory user '{}' has no local account; enroll before using RADIUS",
+                            RadiusAuthenticationHandler.sanitize(canonical));
+                    return new Verification(Outcome.NOT_ENROLLED, null, SOURCE_DIRECTORY);
                 }
                 User user = linked.get();
                 if (isBlocked(user, isLocked)) {
@@ -197,23 +190,6 @@ public class PrimaryCredentialVerifier {
             case INVALID_CREDENTIALS:
             default:
                 return new Verification(Outcome.INVALID_CREDENTIALS, localUser.orElse(null), SOURCE_DIRECTORY);
-        }
-    }
-
-    private Optional<User> provisionPasswordOnlyDirectoryUser(String canonical) {
-        synchronized (provisioningLock) {
-            Optional<User> existing = findLinkedAccount(canonical);
-            if (existing.isPresent()) {
-                return existing;
-            }
-            try {
-                return Optional.of(userRepository.save(User.builder()
-                        .username(canonical)
-                        .enabled(true)
-                        .build()));
-            } catch (DataIntegrityViolationException e) {
-                return findLinkedAccount(canonical);
-            }
         }
     }
 

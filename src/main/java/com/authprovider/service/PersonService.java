@@ -1,5 +1,6 @@
 package com.authprovider.service;
 
+import com.authprovider.dto.PersonRequest;
 import com.authprovider.entity.OtpToken;
 import com.authprovider.entity.Person;
 
@@ -18,7 +19,13 @@ public interface PersonService {
 
     Person createPerson(Person person);
 
+    Person createPerson(PersonRequest request);
+
     Person updatePerson(Long id, Person updated);
+
+    Person updatePerson(Long id, PersonRequest request);
+
+    void deletePerson(Long id);
 
     OtpToken createToken(Long personId, String label, String secret);
 

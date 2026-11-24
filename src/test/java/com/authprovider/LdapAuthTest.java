@@ -47,6 +47,12 @@ public class LdapAuthTest {
     private UserRepository userRepository;
 
     @Autowired
+    private com.authprovider.service.UserService userService;
+
+    @Autowired
+    private com.authprovider.TestClientAssignments assignments;
+
+    @Autowired
     private TotpService totpService;
 
     @Autowired
@@ -338,9 +344,9 @@ public class LdapAuthTest {
     @DisplayName("Subsequent MFA Login: Missing OTP field must be rejected with 401")
     public void testSubsequentLogin_MissingOtpField_Fails() throws Exception {
         userRepository.findByUsername("alice")
-                .orElseGet(() -> userRepository.save(User.builder()
+                .orElseGet(() -> userService.saveUser(User.builder()
                         .username("alice")
-                        .secret("JBSWY3DPEHPK3PXP")
+                        .otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP"))
                         .build()));
 
         Map<String, String> request = Map.of(

@@ -1,6 +1,7 @@
 package com.authprovider.service;
 
 import com.authprovider.config.LdapProperties;
+import com.authprovider.dto.ClientAssignmentRequest;
 import com.authprovider.dto.LoginRequest;
 import com.authprovider.dto.LoginResponse;
 import com.authprovider.entity.AuthAuditLog;
@@ -44,7 +45,33 @@ public class LoginServiceImpl implements LoginService {
     private final Object provisioningLock = new Object();
 
     /** Internal result carrying the audit details next to the API response. */
-    private record Outcome(LoginResponse response, boolean locked) {
+    private record Outcome(LoginResponse response, boolean locked, String reason) {
+        Outcome(LoginResponse response, boolean locked) {
+            this(response, locked, null);
+        }
+    }
+
+    /**
+     * The calling OAuth 2.0 client: its database id, its optional authentication mode override and whether
+     * the account must hold an enabled assignment to it ({@code restricted}).
+     */
+    private record ClientContext(Long clientId, AuthMode clientMode, boolean restricted) {
+        static ClientContext unrestricted(AuthMode clientMode) {
+            return new ClientContext(null, clientMode, false);
+        }
+
+        static ClientContext oauthClient(Long clientId, AuthMode clientMode) {
+            return clientId == null ? unrestricted(clientMode) : new ClientContext(clientId, clientMode, true);
+        }
+    }
+
+    static final String REASON_CLIENT_NOT_ASSIGNED = "CLIENT_NOT_ASSIGNED";
+
+    private UserClientAssignmentService assignmentService;
+
+    @Autowired(required = false)
+    public void setAssignmentService(UserClientAssignmentService assignmentService) {
+        this.assignmentService = assignmentService;
     }
 
     public LoginServiceImpl(LdapProperties ldapProperties,
@@ -95,7 +122,14 @@ public class LoginServiceImpl implements LoginService {
 
     @Override
     public LoginResponse login(LoginRequest request, AuthMode clientAuthMode) {
-        Outcome outcome = doLogin(request, clientAuthMode);
+        Outcome outcome = doLogin(request, ClientContext.unrestricted(clientAuthMode));
+        audit(request, outcome);
+        return outcome.response();
+    }
+
+    @Override
+    public LoginResponse login(LoginRequest request, Long oauthClientId, AuthMode clientAuthMode) {
+        Outcome outcome = doLogin(request, ClientContext.oauthClient(oauthClientId, clientAuthMode));
         audit(request, outcome);
         return outcome.response();
     }
@@ -123,12 +157,14 @@ public class LoginServiceImpl implements LoginService {
         auditService.event(AuthAuditLog.Channel.WEB_LOGIN, outcome)
                 .username(username)
                 .userId(response.getUserId())
-                .reason(result.locked() ? "LOCKED_OUT" : status == null ? null : status.name())
+                .reason(result.locked() ? "LOCKED_OUT"
+                        : result.reason() != null ? result.reason()
+                        : status == null ? null : status.name())
                 .source(response.getAuthenticationSource())
                 .log();
     }
 
-    private Outcome doLogin(LoginRequest request, AuthMode clientMode) {
+    private Outcome doLogin(LoginRequest request, ClientContext clientMode) {
         if (request == null) {
             return result(failure(LoginResponse.Status.INVALID_REQUEST, "Username and password are required"));
         }
@@ -140,6 +176,9 @@ public class LoginServiceImpl implements LoginService {
         if (password == null || password.isEmpty()) {
             AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, isStripRealm());
             if (resolution.isFound() && effectiveAuthMode(resolution.user(), clientMode) == AuthMode.OTP_ONLY) {
+                if (!isAssigned(resolution.user(), clientMode)) {
+                    return notAssigned(resolution.user());
+                }
                 return authenticateOtpOnly(resolution.user(), request.getOtp());
             }
             if (!resolution.isFound() && resolution.status() != AccountResolver.Status.AMBIGUOUS
@@ -158,10 +197,15 @@ public class LoginServiceImpl implements LoginService {
         return authenticateWithDirectory(username, password, request.getOtp(), clientMode);
     }
 
-    private Outcome authenticateWithDirectory(String username, String password, String otp, AuthMode clientMode) {
+    private Outcome authenticateWithDirectory(String username, String password, String otp, ClientContext clientMode) {
         // Lockouts are enforced before the directory bind so that a locked account cannot be used to
         // probe (or lock out) the directory account.
         User lockSubject = lockoutSubjectResolver.resolve(username, isStripRealm()).user();
+        if (lockSubject != null && !isAssigned(lockSubject, clientMode)) {
+            // Accounts not assigned to the calling client are refused before any credential is checked.
+            passwordService.simulateCheck(password);
+            return notAssigned(lockSubject);
+        }
         if (isBlocked(lockSubject)) {
             return locked(lockSubject);
         }
@@ -216,7 +260,7 @@ public class LoginServiceImpl implements LoginService {
         }
     }
 
-    private Outcome completeDirectoryLogin(String username, String otp, boolean autoProvision, AuthMode clientMode) {
+    private Outcome completeDirectoryLogin(String username, String otp, boolean autoProvision, ClientContext clientMode) {
         User user;
         synchronized (provisioningLock) {
             // The directory's canonical name is authoritative: it is linked as is (no realm stripping),
@@ -234,6 +278,9 @@ public class LoginServiceImpl implements LoginService {
                 if (baseAuthMode(clientMode) == AuthMode.PASSWORD_ONLY) {
                     User created = provisionWithoutSecret(username);
                     if (created != null) {
+                        if (!assignProvisionedAccount(created.getId(), clientMode)) {
+                            return result(failure(LoginResponse.Status.ENROLLMENT_FAILED, "Unable to provision account"));
+                        }
                         lockoutService.recordSuccess(created.getId());
                         return authenticatedOutcome(created, SOURCE_DIRECTORY);
                     }
@@ -244,6 +291,9 @@ public class LoginServiceImpl implements LoginService {
                 } else {
                     Outcome provisioned = enrollOutcome(User.builder().username(username).build(), SOURCE_DIRECTORY);
                     if (provisioned.response().getStatus() != LoginResponse.Status.ENROLLMENT_FAILED) {
+                        if (!assignProvisionedAccount(provisioned.response().getUserId(), clientMode)) {
+                            return result(failure(LoginResponse.Status.ENROLLMENT_FAILED, "Unable to provision account"));
+                        }
                         return provisioned;
                     }
                     // Another node may have provisioned the same account concurrently: link to it instead.
@@ -254,6 +304,9 @@ public class LoginServiceImpl implements LoginService {
                 }
             }
             user = resolution.user();
+        }
+        if (!isAssigned(user, clientMode)) {
+            return notAssigned(user);
         }
         if (isBlocked(user)) {
             return locked(user);
@@ -278,7 +331,7 @@ public class LoginServiceImpl implements LoginService {
         }
     }
 
-    private Outcome authenticateLocal(String username, String password, String otp, AuthMode clientMode) {
+    private Outcome authenticateLocal(String username, String password, String otp, ClientContext clientMode) {
         AccountResolver.Resolution<User> resolution = accountResolver.resolve(username, isStripRealm());
         if (!resolution.isFound()) {
             if (resolution.status() == AccountResolver.Status.AMBIGUOUS) {
@@ -288,6 +341,11 @@ public class LoginServiceImpl implements LoginService {
             return result(invalidCredentials());
         }
         User user = resolution.user();
+        if (!isAssigned(user, clientMode)) {
+            // Accounts not assigned to the calling client are refused before any credential is checked.
+            passwordService.simulateCheck(password);
+            return notAssigned(user);
+        }
         if (isBlocked(user)) {
             passwordService.simulateCheck(password);
             return locked(user);
@@ -392,23 +450,70 @@ public class LoginServiceImpl implements LoginService {
     }
 
     /**
-     * Resolves the effective mode like RADIUS clients: an account override wins over the calling OAuth 2.0
-     * client's override, which wins over the policy default. A strict {@code PASSWORD_AND_OTP} account may
-     * still submit its OTP inline when the client requires {@code PASSWORD_AND_OTP_INLINE}.
+     * Resolves the effective mode like RADIUS clients: the override of the account's assignment to the calling
+     * OAuth 2.0 client wins over the client's override, which wins over the policy default. A strict
+     * {@code PASSWORD_AND_OTP} assignment may still submit its OTP inline when the client requires
+     * {@code PASSWORD_AND_OTP_INLINE}.
      */
-    private AuthMode effectiveAuthMode(User user, AuthMode clientMode) {
-        AuthMode base = baseAuthMode(clientMode);
-        if (user != null && user.getAuthMode() != null) {
-            if (user.getAuthMode() == AuthMode.PASSWORD_AND_OTP && clientMode == AuthMode.PASSWORD_AND_OTP_INLINE) {
+    private AuthMode effectiveAuthMode(User user, ClientContext client) {
+        AuthMode base = baseAuthMode(client);
+        AuthMode assigned = assignmentAuthMode(user, client);
+        if (assigned != null) {
+            if (assigned == AuthMode.PASSWORD_AND_OTP && client.clientMode() == AuthMode.PASSWORD_AND_OTP_INLINE) {
                 return AuthMode.PASSWORD_AND_OTP_INLINE;
             }
-            return user.getAuthMode();
+            return assigned;
         }
         return base;
     }
 
-    private AuthMode baseAuthMode(AuthMode clientMode) {
-        return clientMode != null ? clientMode : policyDefaultAuthMode();
+    private AuthMode baseAuthMode(ClientContext client) {
+        return client.clientMode() != null ? client.clientMode() : policyDefaultAuthMode();
+    }
+
+    /** The authentication mode override of the account's enabled assignment to the calling client, if any. */
+    private AuthMode assignmentAuthMode(User user, ClientContext client) {
+        if (user == null || user.getId() == null || client.clientId() == null || assignmentService == null) {
+            return null;
+        }
+        return assignmentService.findEnabledOAuthAssignment(user.getId(), client.clientId())
+                .map(a -> a.getAuthMode())
+                .orElse(null);
+    }
+
+    /** Whether the account may authenticate through the calling client (requires an enabled assignment). */
+    private boolean isAssigned(User user, ClientContext client) {
+        if (!client.restricted()) {
+            return true;
+        }
+        if (user == null || user.getId() == null || assignmentService == null) {
+            return false;
+        }
+        return assignmentService.findEnabledOAuthAssignment(user.getId(), client.clientId()).isPresent();
+    }
+
+    /** Assigns an account auto-provisioned during login to (only) the calling OAuth 2.0 client. */
+    private boolean assignProvisionedAccount(Long userId, ClientContext client) {
+        if (client.clientId() == null) {
+            return true;
+        }
+        if (userId == null || assignmentService == null) {
+            log.error("Unable to assign provisioned account id {} to OAuth client id {}", userId, client.clientId());
+            return false;
+        }
+        try {
+            assignmentService.putOAuthAssignment(userId, client.clientId(),
+                    ClientAssignmentRequest.builder().enabled(true).build());
+            return true;
+        } catch (RuntimeException e) {
+            log.error("Unable to assign provisioned account id {} to OAuth client id {}", userId, client.clientId(), e);
+            return false;
+        }
+    }
+
+    private static Outcome notAssigned(User user) {
+        log.warn("Login refused for account '{}': not assigned to the calling client", user.getUsername());
+        return new Outcome(invalidCredentials(), false, REASON_CLIENT_NOT_ASSIGNED);
     }
 
     private AuthMode policyDefaultAuthMode() {
@@ -501,7 +606,7 @@ public class LoginServiceImpl implements LoginService {
 
         User saved;
         try {
-            user.setSecret(secret);
+            user.setOtpToken(UserOtpServiceImpl.withSecret(null, secret));
             saved = userService.saveUser(user);
         } catch (RuntimeException e) {
             log.error("Failed to persist two-factor secret for {}", user.getUsername(), e);

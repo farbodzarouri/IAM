@@ -1,6 +1,7 @@
 package com.authprovider.controller;
 
 import com.authprovider.dto.MfaPreAuthRequest;
+import com.authprovider.oauth2.OAuthClientAuthentication;
 import com.authprovider.service.MfaPreAuthService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -27,7 +28,11 @@ public class MfaController {
                 || request.getOtp() == null) {
             return ResponseEntity.badRequest().body(false);
         }
-        return ResponseEntity.ok(mfaPreAuthService.preAuthenticate(request.getUsername(), request.getOtp()));
+        Long clientId = OAuthClientAuthentication.current().map(OAuthClientAuthentication.Client::id).orElse(null);
+        if (clientId == null) {
+            return ResponseEntity.ok(mfaPreAuthService.preAuthenticate(request.getUsername(), request.getOtp()));
+        }
+        return ResponseEntity.ok(mfaPreAuthService.preAuthenticate(request.getUsername(), request.getOtp(), clientId));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)

@@ -5,6 +5,7 @@ import com.authprovider.dto.OtpGenerateRequest;
 import com.authprovider.dto.OtpValidationRequest;
 import com.authprovider.dto.OtpValidationResponse;
 import com.authprovider.exception.BadRequestException;
+import com.authprovider.oauth2.OAuthClientAuthentication;
 import com.authprovider.service.UserOtpService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -41,7 +42,11 @@ public class OtpController {
         if (request == null) {
             return respond(OtpValidationResponse.invalidRequest("Username and 6-digit OTP are required"));
         }
-        return respond(userOtpService.validateOtpByUsername(request.getUsername(), request.getOtp()));
+        Long clientId = callingClientId();
+        if (clientId == null) {
+            return respond(userOtpService.validateOtpByUsername(request.getUsername(), request.getOtp()));
+        }
+        return respond(userOtpService.validateOtpByUsername(request.getUsername(), request.getOtp(), clientId));
     }
 
     @PostMapping(value = "/validate-ocra", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -49,8 +54,18 @@ public class OtpController {
         if (request == null) {
             return respond(OtpValidationResponse.invalidRequest("Username, challenge, and OTP are required"));
         }
+        Long clientId = callingClientId();
+        if (clientId == null) {
+            return respond(userOtpService.validateOcraByUsername(
+                    request.getUsername(), request.getChallenge(), request.getOtp()));
+        }
         return respond(userOtpService.validateOcraByUsername(
-                request.getUsername(), request.getChallenge(), request.getOtp()));
+                request.getUsername(), request.getChallenge(), request.getOtp(), clientId));
+    }
+
+    /** Database id of the OAuth 2.0 client calling the (bearer protected) endpoint. */
+    private static Long callingClientId() {
+        return OAuthClientAuthentication.current().map(OAuthClientAuthentication.Client::id).orElse(null);
     }
 
     @ExceptionHandler({HttpMessageNotReadableException.class, MethodArgumentTypeMismatchException.class})

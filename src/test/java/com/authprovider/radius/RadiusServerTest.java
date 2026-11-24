@@ -65,7 +65,7 @@ class RadiusServerTest {
         userRepository = mock(UserRepository.class);
         userOtpService = mock(UserOtpService.class);
 
-        User alice = User.builder().id(1L).username("alice").password(PASSWORD).secret("JBSWY3DPEHPK3PXP").build();
+        User alice = User.builder().id(1L).username("alice").password(PASSWORD).otpToken(com.authprovider.TestUsers.token("JBSWY3DPEHPK3PXP")).build();
         User bob = User.builder().id(2L).username("bob").password(PASSWORD).build();
         when(userRepository.findByUsername(anyString())).thenReturn(Optional.empty());
         when(userRepository.findByUsername("alice")).thenReturn(Optional.of(alice));

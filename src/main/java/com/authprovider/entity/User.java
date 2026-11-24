@@ -31,10 +31,6 @@ public class User {
     private String password;
 
     @ToString.Exclude
-    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
-    private String secret;
-
-    @ToString.Exclude
     @JsonIgnore
     @ManyToOne(fetch = FetchType.EAGER)
     @JoinColumn(name = "person_id")
@@ -50,22 +46,13 @@ public class User {
     @Column(name = "enabled", nullable = false)
     private boolean enabled = true;
 
-    /** Optional per-account authentication mode override (null inherits client/policy default). */
-    @Enumerated(EnumType.STRING)
-    @Column(name = "auth_mode", length = 32)
-    private AuthMode authMode;
-
-    @JsonProperty(access = JsonProperty.Access.WRITE_ONLY)
-    public String getSecret() {
-        if (otpToken != null) {
-            return otpToken.isEnabled() ? otpToken.getSecret() : null;
-        }
-        return secret;
-    }
-
+    /**
+     * The OTP secret of the bound, enabled {@link OtpToken} ({@code null} when no enabled token is bound).
+     * OTP secrets are stored only in {@link OtpToken}; the account itself holds no secret.
+     */
     @JsonIgnore
-    public String getRawSecret() {
-        return secret;
+    public String getSecret() {
+        return otpToken != null && otpToken.isEnabled() ? otpToken.getSecret() : null;
     }
 
     @JsonIgnore

@@ -31,6 +31,7 @@ public class UserServiceImpl implements UserService {
     private final AccountLockoutService lockoutService;
     private final OtpUsageStore otpUsageStore;
     private final PasswordService passwordService;
+    private UserClientAssignmentService assignmentService;
 
     @Autowired
     public UserServiceImpl(UserRepository userRepository,
@@ -50,6 +51,11 @@ public class UserServiceImpl implements UserService {
         if (this.lockoutService != null && this.userRepository != null) {
             this.lockoutService.addTokenLockListener(this::invalidateUsersForToken);
         }
+    }
+
+    @Autowired(required = false)
+    public void setAssignmentService(UserClientAssignmentService assignmentService) {
+        this.assignmentService = assignmentService;
     }
 
     @Override
@@ -80,14 +86,15 @@ public class UserServiceImpl implements UserService {
         if (request == null || request.getUsername() == null || request.getUsername().isBlank()) {
             throw new BadRequestException("Username is required");
         }
+        validateRequestedAssignments(request);
         User user = User.builder()
                 .username(request.getUsername().trim())
                 .password(request.getPassword())
-                .secret(request.getSecret())
                 .enabled(request.getEnabled() == null || request.getEnabled())
-                .authMode(request.getAuthMode())
                 .build();
-        return persistUser(user, request.getSecret(), request.getPersonId(), request.getOtpTokenId(), null);
+        User created = persistUser(user, request.getSecret(), request.getPersonId(), request.getOtpTokenId(), null);
+        applyRequestedAssignments(created, request);
+        return created;
     }
 
     @Override
@@ -96,6 +103,7 @@ public class UserServiceImpl implements UserService {
         if (request == null) {
             throw new BadRequestException("User payload is required");
         }
+        validateRequestedAssignments(request);
         CredentialSnapshot before = snapshot(id);
         User existing = getUserOrThrow(id);
         String username = request.getUsername() != null ? request.getUsername().trim() : existing.getUsername();
@@ -110,11 +118,26 @@ public class UserServiceImpl implements UserService {
                 .person(existing.getPerson())
                 .otpToken(existing.getOtpToken())
                 .enabled(request.getEnabled() != null ? request.getEnabled() : existing.isEnabled())
-                .authMode(request.getAuthMode() != null ? request.getAuthMode() : existing.getAuthMode())
                 .build();
         String requestedSecret = request.getSecret() != null && !request.getSecret().isBlank()
-                ? request.getSecret() : existing.getRawSecret();
-        return persistUser(updated, requestedSecret, request.getPersonId(), request.getOtpTokenId(), before);
+                ? request.getSecret() : null;
+        User saved = persistUser(updated, requestedSecret, request.getPersonId(), request.getOtpTokenId(), before);
+        applyRequestedAssignments(saved, request);
+        return saved;
+    }
+
+    private void validateRequestedAssignments(UserRequest request) {
+        if (assignmentService != null && request != null
+                && (request.getRadiusClients() != null || request.getOauthClients() != null)) {
+            assignmentService.validateAssignments(request.getRadiusClients(), request.getOauthClients());
+        }
+    }
+
+    private void applyRequestedAssignments(User user, UserRequest request) {
+        if (assignmentService != null && user != null && user.getId() != null && request != null
+                && (request.getRadiusClients() != null || request.getOauthClients() != null)) {
+            assignmentService.replaceAssignments(user.getId(), request.getRadiusClients(), request.getOauthClients());
+        }
     }
 
     @Override
@@ -126,6 +149,11 @@ public class UserServiceImpl implements UserService {
         if (user.getUsername() != null) {
             user.setUsername(user.getUsername().trim());
         }
+        if (user.getId() != null) {
+            // The account may be a managed entity (e.g. open session in view): a new token must be persisted
+            // before any query flushes the account's reference to it.
+            persistNewToken(user);
+        }
         CredentialSnapshot before = user.getId() == null ? null : snapshot(user.getId());
         User existingEntity = user.getId() == null ? null : getUserOrThrow(user.getId());
         if (existingEntity != null) {
@@ -135,15 +163,11 @@ public class UserServiceImpl implements UserService {
             if (user.getPerson() == null) {
                 user.setPerson(existingEntity.getPerson());
             }
-            if (user.getOtpToken() == null && (user.getRawSecret() == null || user.getRawSecret().isBlank())) {
+            if (user.getOtpToken() == null) {
                 user.setOtpToken(existingEntity.getOtpToken());
-                user.setSecret(existingEntity.getRawSecret());
-            }
-            if (user.getAuthMode() == null) {
-                user.setAuthMode(existingEntity.getAuthMode());
             }
         }
-        return persistUser(user, user.getRawSecret(), null, null, before);
+        return persistUser(user, null, null, null, before);
     }
 
     private User persistUser(User user, String rawSecret, Long requestedPersonId,
@@ -156,7 +180,18 @@ public class UserServiceImpl implements UserService {
             resolveLinksAndValidate(user, rawSecret, requestedPersonId, requestedOtpTokenId);
         } else {
             validateAdminCredentialSeparation(user);
-            user.setSecret(rawSecret);
+            if (rawSecret != null && !rawSecret.isBlank()) {
+                if (user.getOtpToken() == null) {
+                    user.setOtpToken(OtpToken.builder()
+                            .person(user.getPerson())
+                            .label(user.getUsername() == null ? "authenticator" : user.getUsername())
+                            .secret(rawSecret)
+                            .enabled(true)
+                            .build());
+                } else {
+                    user.getOtpToken().setSecret(rawSecret);
+                }
+            }
         }
 
         user.setPassword(passwordService.encode(user.getPassword()));
@@ -189,7 +224,8 @@ public class UserServiceImpl implements UserService {
         if (user.getPerson() == null && user.getOtpToken() != null && user.getOtpToken().getPerson() != null) {
             user.setPerson(user.getOtpToken().getPerson());
         }
-        if (user.getOtpToken() != null && user.getPerson() != null) {
+        boolean newToken = user.getOtpToken() != null && user.getOtpToken().getId() == null;
+        if (user.getOtpToken() != null && user.getPerson() != null && !newToken) {
             Long tokenPersonId = user.getOtpToken().getPerson() == null ? null : user.getOtpToken().getPerson().getId();
             if (!Objects.equals(tokenPersonId, user.getPerson().getId())) {
                 throw new BadRequestException("OTP token does not belong to the user's person");
@@ -211,26 +247,71 @@ public class UserServiceImpl implements UserService {
             user.setPerson(personRepository.save(user.getPerson()));
         }
 
+        // OTP secrets are only stored in OtpToken.
         if (user.getOtpToken() == null && rawSecret != null && !rawSecret.isBlank()) {
             OtpToken token = otpTokenRepository.save(OtpToken.builder()
                     .person(user.getPerson())
-                    .label(user.getUsername() == null ? "authenticator" : user.getUsername())
+                    .label(defaultTokenLabel(user))
                     .secret(rawSecret)
                     .enabled(true)
                     .build());
             user.setOtpToken(token);
-            user.setSecret(null);
+        } else if (newToken) {
+            // A new (not yet persisted) token attached to the account, e.g. during enrollment.
+            OtpToken token = user.getOtpToken();
+            token.setPerson(user.getPerson());
+            if (token.getLabel() == null || token.getLabel().isBlank()) {
+                token.setLabel(defaultTokenLabel(user));
+            }
+            if (rawSecret != null && !rawSecret.isBlank()) {
+                token.setSecret(rawSecret);
+            }
+            if (token.getSecret() == null || token.getSecret().isBlank()) {
+                throw new BadRequestException("OTP token secret is required");
+            }
+            user.setOtpToken(otpTokenRepository.save(token));
         } else if (user.getOtpToken() != null) {
             OtpToken token = user.getOtpToken();
-            if (rawSecret != null && !rawSecret.isBlank() && !Objects.equals(rawSecret, token.getSecret())) {
+            if (rawSecret != null && !rawSecret.isBlank()) {
                 token.setSecret(rawSecret);
-                token = otpTokenRepository.save(token);
-                user.setOtpToken(token);
             }
-            user.setSecret(null);
-        } else {
-            user.setSecret(null);
+            // Persist a secret change made on the bound token (e.g. secret regeneration).
+            String stored = otpTokenRepository.findSecretById(token.getId()).orElse(null);
+            if (!Objects.equals(stored, token.getSecret())) {
+                user.setOtpToken(otpTokenRepository.save(token));
+            }
         }
+    }
+
+    /** Persists a new (unsaved) OTP token attached to an existing account, creating its Person if needed. */
+    private void persistNewToken(User user) {
+        OtpToken token = user.getOtpToken();
+        if (token == null || token.getId() != null || personRepository == null || otpTokenRepository == null) {
+            return;
+        }
+        if (token.getSecret() == null || token.getSecret().isBlank()) {
+            throw new BadRequestException("OTP token secret is required");
+        }
+        Person person = user.getPerson();
+        if (person == null) {
+            User stored = userRepository.findById(user.getId()).orElse(null);
+            person = stored == null ? null : stored.getPerson();
+        }
+        if (person == null) {
+            person = personRepository.save(Person.builder().displayName(defaultTokenLabel(user)).enabled(true).build());
+        } else if (person.getId() == null) {
+            person = personRepository.save(person);
+        }
+        user.setPerson(person);
+        token.setPerson(person);
+        if (token.getLabel() == null || token.getLabel().isBlank()) {
+            token.setLabel(defaultTokenLabel(user));
+        }
+        user.setOtpToken(otpTokenRepository.save(token));
+    }
+
+    private static String defaultTokenLabel(User user) {
+        return user.getUsername() == null || user.getUsername().isBlank() ? "authenticator" : user.getUsername();
     }
 
     private void handlePostUpdateLifecycle(CredentialSnapshot before, User after) {
@@ -282,6 +363,9 @@ public class UserServiceImpl implements UserService {
         }
         if (lockoutService != null) {
             lockoutService.recordSuccess(id);
+        }
+        if (assignmentService != null) {
+            assignmentService.deleteAllForUser(id);
         }
         userRepository.delete(existing);
         if (tokenId != null && otpUsageStore != null && !isTokenStillReferenced(tokenId)) {

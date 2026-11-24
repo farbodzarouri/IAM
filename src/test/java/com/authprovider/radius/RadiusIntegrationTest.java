@@ -38,6 +38,12 @@ class RadiusIntegrationTest {
     private UserRepository userRepository;
 
     @Autowired
+    private com.authprovider.service.UserService userService;
+
+    @Autowired
+    private com.authprovider.TestClientAssignments assignments;
+
+    @Autowired
     private TotpService totpService;
 
     @Test
@@ -53,15 +59,17 @@ class RadiusIntegrationTest {
     @Test
     void authenticatesAgainstDatabaseUserWithTotp() throws Exception {
         String secret = "JBSWY3DPEHPK3PXP";
-        userRepository.save(User.builder().username("rdg-user").password("Str0ng!Pass").secret(secret).build());
+        userService.saveUser(User.builder().username("rdg-user").password("Str0ng!Pass").otpToken(com.authprovider.TestUsers.token(secret)).build());
 
         try (RadiusTestClient client = new RadiusTestClient(radiusServer.getLocalPort(), "integration-secret")) {
+            assignments.assignAll();
             RadiusPacket challenge = client.sendExpectingResponse(client.accessRequest("rdg-user", "Str0ng!Pass", null));
             assertEquals(ACCESS_CHALLENGE, challenge.getCode());
             assertEquals(45, challenge.getAttribute(ATTR_SESSION_TIMEOUT).orElseThrow().getValueAsInteger());
             byte[] state = challenge.getAttribute(ATTR_STATE).orElseThrow().getValue();
 
             String otp = String.format("%06d", totpService.generateOtp(secret));
+            assignments.assignAll();
             RadiusPacket accept = client.sendExpectingResponse(client.accessRequest("rdg-user", otp, state));
             assertEquals(ACCESS_ACCEPT, accept.getCode());
         }

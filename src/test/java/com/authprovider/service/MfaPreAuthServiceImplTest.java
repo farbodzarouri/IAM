@@ -35,7 +35,7 @@ class MfaPreAuthServiceImplTest {
     void setUp() {
         userService = mock(UserService.class);
         totpService = mock(TotpService.class);
-        User user = User.builder().id(1L).username("JDoe").secret("S").build();
+        User user = User.builder().id(1L).username("JDoe").otpToken(com.authprovider.TestUsers.token("S")).build();
         when(userService.findByUsernameIgnoreCase(anyString())).thenReturn(List.of());
         when(userService.findByUsernameIgnoreCase("jdoe")).thenReturn(List.of(user));
         when(userService.findByUsernameIgnoreCase("JDoe")).thenReturn(List.of(user));

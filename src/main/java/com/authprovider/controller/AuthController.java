@@ -27,10 +27,11 @@ public class AuthController {
 
     @PostMapping(value = "/login", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<LoginResponse> login(@RequestBody(required = false) LoginRequest request) {
-        AuthMode clientAuthMode = OAuthClientAuthentication.current()
-                .map(OAuthClientAuthentication.Client::authMode)
-                .orElse(null);
-        return respond(loginService.login(request, clientAuthMode));
+        OAuthClientAuthentication.Client client = OAuthClientAuthentication.current().orElse(null);
+        if (client == null || client.id() == null) {
+            return respond(loginService.login(request, (AuthMode) null));
+        }
+        return respond(loginService.login(request, client.id(), client.authMode()));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)

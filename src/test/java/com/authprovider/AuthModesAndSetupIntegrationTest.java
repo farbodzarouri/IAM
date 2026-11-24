@@ -92,6 +92,8 @@ class AuthModesAndSetupIntegrationTest {
     @Autowired private OtpTokenRepository otpTokenRepository;
     @Autowired private AdminRepository adminRepository;
     @Autowired private UserRepository userRepository;
+    @Autowired private com.authprovider.service.UserService userService;
+    @Autowired private com.authprovider.TestClientAssignments assignments;
     @Autowired private AuthFailureRecordRepository failureRepository;
     @Autowired private RadiusChallengeSessionRepository challengeRepository;
     @Autowired private RadiusClientRepository radiusClientRepository;
@@ -230,6 +232,7 @@ class AuthModesAndSetupIntegrationTest {
     }
 
     private RadiusPacket sendRadius(String userName, String password, byte[] state) throws Exception {
+        assignments.assignAll();
         byte[] secretBytes = RADIUS_SECRET.getBytes(StandardCharsets.UTF_8);
         byte[] authenticator = new byte[16];
         RANDOM.nextBytes(authenticator);
@@ -369,7 +372,6 @@ class AuthModesAndSetupIntegrationTest {
         User inlineUser = userRepository.save(User.builder()
                 .username("alice")
                 .password(USER_PASS)
-                .secret(sharedSecret)
                 .person(person)
                 .otpToken(token)
                 .build());
@@ -379,17 +381,15 @@ class AuthModesAndSetupIntegrationTest {
                 .person(person)
                 .otpToken(token)
                 .build());
-        userRepository.save(User.builder()
+        assignments.authMode(userRepository.save(User.builder()
                 .username("svc-acct")
                 .password(USER_PASS)
-                .authMode(AuthMode.PASSWORD_ONLY)
-                .build());
-        User strictUser = userRepository.save(User.builder()
+                .build()), AuthMode.PASSWORD_ONLY);
+        User strictUser = assignments.authMode(userService.saveUser(User.builder()
                 .username("strict-mfa")
                 .password(USER_PASS)
-                .secret(sharedSecret)
-                .authMode(AuthMode.PASSWORD_AND_OTP)
-                .build());
+                .otpToken(com.authprovider.TestUsers.token(sharedSecret))
+                .build()), AuthMode.PASSWORD_AND_OTP);
 
         // 1. Service account with authMode=PASSWORD_ONLY gets single-factor Access-Accept without OTP
         assertEquals(RadiusConstants.ACCESS_ACCEPT, sendRadius("svc-acct", USER_PASS, null).getCode());
@@ -439,7 +439,6 @@ class AuthModesAndSetupIntegrationTest {
         User bob = userRepository.save(User.builder()
                 .username("bob")
                 .password(USER_PASS)
-                .secret(otpOnlySecret)
                 .person(p2)
                 .otpToken(tok2)
                 .build());
@@ -482,42 +481,37 @@ class AuthModesAndSetupIntegrationTest {
         OtpToken token = personService.createToken(person.getId(), "rest-tok", secret);
 
         // PASSWORD_ONLY user logs in via REST without OTP or enrollment
-        userRepository.save(User.builder()
+        assignments.authMode(userRepository.save(User.builder()
                 .username("rest-pw-only")
                 .password(USER_PASS)
-                .authMode(AuthMode.PASSWORD_ONLY)
-                .build());
+                .build()), AuthMode.PASSWORD_ONLY);
         JsonNode pwOnlyResp = postLogin("/v1/api/auth/login", "rest-pw-only", USER_PASS, null);
         assertTrue(pwOnlyResp.path("authenticated").asBoolean());
         assertEquals("AUTHENTICATED", pwOnlyResp.path("status").asText());
 
         // PASSWORD_AND_OTP_INLINE user logs in via REST with <pw><otp>
-        userRepository.save(User.builder()
+        assignments.authMode(userService.saveUser(User.builder()
                 .username("rest-inline")
                 .password(USER_PASS)
-                .secret(secret)
-                .authMode(AuthMode.PASSWORD_AND_OTP_INLINE)
-                .build());
+                .otpToken(com.authprovider.TestUsers.token(secret))
+                .build()), AuthMode.PASSWORD_AND_OTP_INLINE);
         assertTrue(postLogin("/v1/api/auth/login", "rest-inline", USER_PASS + otpForStep(secret, step - 1), null)
                 .path("authenticated").asBoolean());
 
         // OTP_ONLY unenrolled user cannot self-enroll without password
-        userRepository.save(User.builder()
+        assignments.authMode(userRepository.save(User.builder()
                 .username("rest-otp-unenrolled")
-                .authMode(AuthMode.OTP_ONLY)
-                .build());
+                .build()), AuthMode.OTP_ONLY);
         JsonNode unenrolledResp = postLogin("/v1/api/auth/login", "rest-otp-unenrolled", null, otpForStep(secret, step));
         assertFalse(unenrolledResp.path("authenticated").asBoolean());
         assertEquals("NOT_PROVISIONED", unenrolledResp.path("status").asText());
 
         // OTP_ONLY enrolled user authenticates with OTP alone and locks only User on wrong attempts
-        User otpOnlyUser = userRepository.save(User.builder()
+        User otpOnlyUser = assignments.authMode(userRepository.save(User.builder()
                 .username("rest-otp-only")
-                .secret(secret)
                 .person(person)
                 .otpToken(token)
-                .authMode(AuthMode.OTP_ONLY)
-                .build());
+                .build()), AuthMode.OTP_ONLY);
         adminRepository.save(Admin.builder()
                 .username("rest.admin")
                 .password(ADMIN_PASS)

@@ -48,7 +48,7 @@ class PrimaryCredentialVerifierTest {
     @Test
     void directoryDisabledUsesLocalPasswords() {
         ldapProperties.setEnabled(false);
-        localUser(User.builder().id(1L).username("dave").password("pw").secret(TOTP_SECRET).build());
+        localUser(User.builder().id(1L).username("dave").password("pw").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
 
         assertEquals(AUTHENTICATED, verifier.verify("dave", pw("pw"), id -> false).outcome());
         assertEquals(INVALID_CREDENTIALS, verifier.verify("dave", pw("bad"), id -> false).outcome());
@@ -57,7 +57,7 @@ class PrimaryCredentialVerifierTest {
 
     @Test
     void directoryAuthenticatedUserIsLinkedToEnrolledAccount() {
-        localUser(User.builder().id(1L).username("alice").secret(TOTP_SECRET).build());
+        localUser(User.builder().id(1L).username("alice").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
         when(directory.authenticate("alice", "dirpw"))
                 .thenReturn(DirectoryAuthenticationResult.authenticated("alice", "uid=alice,dc=example,dc=org"));
 
@@ -80,7 +80,7 @@ class PrimaryCredentialVerifierTest {
     @Test
     void invalidDirectoryPasswordNeverFallsBackToLocal() {
         ldapProperties.setFallbackToLocal(true);
-        localUser(User.builder().id(3L).username("carol").password("localpw").secret(TOTP_SECRET).build());
+        localUser(User.builder().id(3L).username("carol").password("localpw").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
         when(directory.authenticate("carol", "localpw")).thenReturn(DirectoryAuthenticationResult.invalidCredentials());
 
         PrimaryCredentialVerifier.Verification result = verifier.verify("carol", pw("localpw"), id -> false);
@@ -90,7 +90,7 @@ class PrimaryCredentialVerifierTest {
 
     @Test
     void userUnknownToDirectoryUsesLocalOnlyWhenFallbackEnabled() {
-        localUser(User.builder().id(4L).username("local").password("localpw").secret(TOTP_SECRET).build());
+        localUser(User.builder().id(4L).username("local").password("localpw").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
         when(directory.authenticate(anyString(), anyString())).thenReturn(DirectoryAuthenticationResult.userNotFound());
 
         assertEquals(UNKNOWN_USER, verifier.verify("local", pw("localpw"), id -> false).outcome());
@@ -111,7 +111,7 @@ class PrimaryCredentialVerifierTest {
 
     @Test
     void lockedAccountsDoNotReachTheDirectory() {
-        localUser(User.builder().id(5L).username("eve").secret(TOTP_SECRET).build());
+        localUser(User.builder().id(5L).username("eve").otpToken(com.authprovider.TestUsers.token(TOTP_SECRET)).build());
         assertEquals(LOCKED, verifier.verify("eve", pw("pw"), id -> id == 5L).outcome());
         verifyNoInteractions(directory);
     }

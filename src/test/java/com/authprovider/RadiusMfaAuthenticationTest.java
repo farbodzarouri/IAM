@@ -48,6 +48,12 @@ public class RadiusMfaAuthenticationTest {
     private MockMvc mockMvc;
 
     @Autowired
+    private com.authprovider.TestClientAssignments assignments;
+
+    @Autowired
+    private com.authprovider.service.UserService userService;
+
+    @Autowired
     private UserRepository userRepository;
 
     @Autowired
@@ -68,9 +74,9 @@ public class RadiusMfaAuthenticationTest {
         User user = User.builder()
                 .username(username)
                 .password("password123")
-                .secret(secret)
+                .otpToken(com.authprovider.TestUsers.token(secret))
                 .build();
-        return userRepository.save(user);
+        return userService.saveUser(user);
     }
 
     @Test
@@ -268,6 +274,7 @@ public class RadiusMfaAuthenticationTest {
     }
 
     private byte[] sendRadiusPacket(byte[] packetBytes, int timeoutMs) throws Exception {
+        assignments.assignAll();
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setSoTimeout(timeoutMs);
             DatagramPacket req = new DatagramPacket(
