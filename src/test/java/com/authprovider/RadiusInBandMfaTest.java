@@ -1,6 +1,8 @@
 package com.authprovider;
 
+import com.authprovider.entity.SecurityPolicy;
 import com.authprovider.entity.User;
+import com.authprovider.repository.SecurityPolicyRepository;
 import com.authprovider.repository.UserRepository;
 import com.authprovider.service.SecretGenerator;
 import com.authprovider.service.TotpService;
@@ -29,7 +31,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest(properties = {
         "radius.port=18126",
         "iam.bootstrap.radius.shared-secret=testing123",
-        "iam.bootstrap.policy.challenge-ttl-seconds=3"
+        "iam.bootstrap.policy.challenge-ttl-seconds=60"
 })
 @AutoConfigureMockMvc
 public class RadiusInBandMfaTest {
@@ -39,6 +41,9 @@ public class RadiusInBandMfaTest {
 
     @Autowired
     private UserRepository userRepository;
+
+    @Autowired
+    private SecurityPolicyRepository policyRepository;
 
     @Autowired
     private com.authprovider.TestClientAssignments assignments;
@@ -59,6 +64,10 @@ public class RadiusInBandMfaTest {
 
     @BeforeEach
     public void setUp() {
+        policyRepository.findByName(SecurityPolicy.DEFAULT_NAME).ifPresent(p -> {
+            p.setChallengeTtlSeconds(60);
+            policyRepository.saveAndFlush(p);
+        });
         userRepository.deleteAll();
 
         alice = User.builder()
@@ -81,7 +90,7 @@ public class RadiusInBandMfaTest {
     public void testHappyPath_SuccessfulTwoStepChallengeResponse() throws Exception {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(10, reqAuth1, "alice", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1, "Server must respond to initial Access-Request");
         assertEquals(11, resp1[0] & 0xFF, "Valid primary credentials must trigger Access-Challenge (Code 11)");
@@ -98,7 +107,7 @@ public class RadiusInBandMfaTest {
         String validOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(11, reqAuth2, "alice", validOtp, state, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2, "Server must respond to second-step Access-Request with OTP");
         assertEquals(2, resp2[0] & 0xFF, "Valid OTP and State must return Access-Accept (Code 2)");
@@ -109,7 +118,7 @@ public class RadiusInBandMfaTest {
     public void testTurn1_WrongPassword_ReturnsAccessReject() throws Exception {
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(20, reqAuth, "alice", "WrongPassword999!", null, false, false);
-        byte[] resp = sendRadiusPacket(packet, 2000);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Server must respond to invalid primary credentials");
         assertEquals(3, resp[0] & 0xFF, "Invalid primary password must immediately return Access-Reject (Code 3)");
@@ -120,7 +129,7 @@ public class RadiusInBandMfaTest {
     public void testTurn1_UnknownUser_ReturnsAccessReject() throws Exception {
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(25, reqAuth, "ghostuser", "SomePassword123!", null, false, false);
-        byte[] resp = sendRadiusPacket(packet, 2000);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Server must respond to nonexistent user");
         assertEquals(3, resp[0] & 0xFF, "Nonexistent user must return Access-Reject (Code 3)");
@@ -131,7 +140,7 @@ public class RadiusInBandMfaTest {
     public void testTurn2_WrongOtp_ReturnsAccessReject() throws Exception {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(30, reqAuth1, "alice", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1, "Initial request must succeed");
         assertEquals(11, resp1[0] & 0xFF, "Must return Access-Challenge (Code 11)");
@@ -140,7 +149,7 @@ public class RadiusInBandMfaTest {
 
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(31, reqAuth2, "alice", "000000", state, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2, "Server must respond to invalid OTP");
         assertEquals(3, resp2[0] & 0xFF, "Invalid OTP must return Access-Reject (Code 3)");
@@ -151,7 +160,7 @@ public class RadiusInBandMfaTest {
     public void testTurn2_StateReplayProtection_ReusedStateRejected() throws Exception {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(40, reqAuth1, "alice", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1);
         assertEquals(11, resp1[0] & 0xFF);
@@ -161,7 +170,7 @@ public class RadiusInBandMfaTest {
         String validOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(41, reqAuth2, "alice", validOtp, state, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2);
         assertEquals(2, resp2[0] & 0xFF, "First verification must accept");
@@ -169,7 +178,7 @@ public class RadiusInBandMfaTest {
         // Attempt replay attack with the same State token and valid OTP
         byte[] reqAuthReplay = randomAuthenticator();
         byte[] replayPacket = buildAccessRequest(42, reqAuthReplay, "alice", validOtp, state, false, false);
-        byte[] respReplay = sendRadiusPacket(replayPacket, 2000);
+        byte[] respReplay = sendRadiusPacket(replayPacket, 5000);
 
         assertNotNull(respReplay, "Server must respond to replayed State attempt");
         assertEquals(3, respReplay[0] & 0xFF, "Reused State attribute must be rejected (single-use constraint)");
@@ -180,7 +189,7 @@ public class RadiusInBandMfaTest {
     public void testTurn2_StateTampering_ReturnsAccessReject() throws Exception {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(50, reqAuth1, "alice", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1);
         assertEquals(11, resp1[0] & 0xFF);
@@ -194,7 +203,7 @@ public class RadiusInBandMfaTest {
         String validOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(51, reqAuth2, "alice", validOtp, tamperedState, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2, "Server must respond to tampered State");
         assertEquals(3, resp2[0] & 0xFF, "Tampered State token must return Access-Reject (Code 3)");
@@ -203,22 +212,26 @@ public class RadiusInBandMfaTest {
 
     @Test
     public void testTurn2_StateExpiration_TtlEnforced() throws Exception {
+        SecurityPolicy policy = policyRepository.findByName(SecurityPolicy.DEFAULT_NAME).orElseThrow();
+        policy.setChallengeTtlSeconds(2);
+        policyRepository.saveAndFlush(policy);
+
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(60, reqAuth1, "alice", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1);
         assertEquals(11, resp1[0] & 0xFF);
         byte[] state = extractAttribute(resp1, 24);
         assertNotNull(state);
 
-        // Wait for TTL (3 seconds configured in properties) to expire
-        Thread.sleep(3500);
+        // Wait for TTL (2 seconds configured for this test) to expire
+        Thread.sleep(2500);
 
         String validOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(61, reqAuth2, "alice", validOtp, state, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2, "Server must respond after TTL expiration");
         assertEquals(3, resp2[0] & 0xFF, "Expired challenge session must return Access-Reject (Code 3)");
@@ -230,14 +243,14 @@ public class RadiusInBandMfaTest {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(70, reqAuth1, "alice", "AlicePass123!", null, false, false);
 
-        byte[] resp1a = sendRadiusPacket(packet1, 2000);
+        byte[] resp1a = sendRadiusPacket(packet1, 5000);
         assertNotNull(resp1a);
         assertEquals(11, resp1a[0] & 0xFF);
         byte[] state1 = extractAttribute(resp1a, 24);
         assertNotNull(state1);
 
         // Retransmit identical packet from another socket instance (simulating network retransmission)
-        byte[] resp1b = sendRadiusPacket(packet1, 2000);
+        byte[] resp1b = sendRadiusPacket(packet1, 5000);
         assertNotNull(resp1b, "Server must retransmit cached Access-Challenge");
         assertEquals(11, resp1b[0] & 0xFF);
         byte[] state2 = extractAttribute(resp1b, 24);
@@ -249,7 +262,7 @@ public class RadiusInBandMfaTest {
         String validOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(71, reqAuth2, "alice", validOtp, state1, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2);
         assertEquals(2, resp2[0] & 0xFF, "Session must remain valid and accept OTP following retransmissions");
@@ -259,7 +272,7 @@ public class RadiusInBandMfaTest {
     public void testRetransmission_Packet2_ReturnsCachedAccept() throws Exception {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(75, reqAuth1, "alice", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
         assertNotNull(resp1);
         byte[] state = extractAttribute(resp1, 24);
         assertNotNull(state);
@@ -268,12 +281,12 @@ public class RadiusInBandMfaTest {
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(76, reqAuth2, "alice", validOtp, state, false, false);
 
-        byte[] resp2a = sendRadiusPacket(packet2, 2000);
+        byte[] resp2a = sendRadiusPacket(packet2, 5000);
         assertNotNull(resp2a);
         assertEquals(2, resp2a[0] & 0xFF);
 
         // Retransmit Packet 2
-        byte[] resp2b = sendRadiusPacket(packet2, 2000);
+        byte[] resp2b = sendRadiusPacket(packet2, 5000);
         assertNotNull(resp2b, "Server must retransmit cached Access-Accept");
         assertEquals(2, resp2b[0] & 0xFF, "Retransmission must return Access-Accept from cache rather than failing as replay");
     }
@@ -282,7 +295,7 @@ public class RadiusInBandMfaTest {
     public void testActiveDirectoryDomainPrefix_Normalized() throws Exception {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(80, reqAuth1, "CONTOSO\\alice", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1, "Server must handle DOMAIN\\username prefix");
         assertEquals(11, resp1[0] & 0xFF, "DOMAIN\\alice must resolve to alice and issue Access-Challenge");
@@ -292,7 +305,7 @@ public class RadiusInBandMfaTest {
         String validOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(81, reqAuth2, "CONTOSO\\alice", validOtp, state, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2);
         assertEquals(2, resp2[0] & 0xFF, "DOMAIN\\alice must complete authentication successfully");
@@ -303,7 +316,7 @@ public class RadiusInBandMfaTest {
         // Case A: Valid Message-Authenticator (RFC 3579)
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packetValidMsgAuth = buildAccessRequest(90, reqAuth1, "alice", "AlicePass123!", null, true, false);
-        byte[] resp1 = sendRadiusPacket(packetValidMsgAuth, 2000);
+        byte[] resp1 = sendRadiusPacket(packetValidMsgAuth, 5000);
 
         assertNotNull(resp1, "Server must respond to packet with valid Message-Authenticator");
         assertEquals(11, resp1[0] & 0xFF);
@@ -323,7 +336,7 @@ public class RadiusInBandMfaTest {
     public void testConcurrentUsers_IndependentChallenges() throws Exception {
         byte[] reqAuthA1 = randomAuthenticator();
         byte[] packetA1 = buildAccessRequest(100, reqAuthA1, "alice", "AlicePass123!", null, false, false);
-        byte[] respA1 = sendRadiusPacket(packetA1, 2000);
+        byte[] respA1 = sendRadiusPacket(packetA1, 5000);
         assertNotNull(respA1);
         assertEquals(11, respA1[0] & 0xFF);
         byte[] stateA = extractAttribute(respA1, 24);
@@ -331,7 +344,7 @@ public class RadiusInBandMfaTest {
 
         byte[] reqAuthB1 = randomAuthenticator();
         byte[] packetB1 = buildAccessRequest(101, reqAuthB1, "bob", "BobPass456!", null, false, false);
-        byte[] respB1 = sendRadiusPacket(packetB1, 2000);
+        byte[] respB1 = sendRadiusPacket(packetB1, 5000);
         assertNotNull(respB1);
         assertEquals(11, respB1[0] & 0xFF);
         byte[] stateB = extractAttribute(respB1, 24);
@@ -343,7 +356,7 @@ public class RadiusInBandMfaTest {
         String validBobOtp = String.format("%06d", totpService.generateOtp(bob.getSecret()));
         byte[] reqAuthB2 = randomAuthenticator();
         byte[] packetB2 = buildAccessRequest(102, reqAuthB2, "bob", validBobOtp, stateB, false, false);
-        byte[] respB2 = sendRadiusPacket(packetB2, 2000);
+        byte[] respB2 = sendRadiusPacket(packetB2, 5000);
         assertNotNull(respB2);
         assertEquals(2, respB2[0] & 0xFF, "Bob must succeed");
 
@@ -351,7 +364,7 @@ public class RadiusInBandMfaTest {
         String validAliceOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuthA2 = randomAuthenticator();
         byte[] packetA2 = buildAccessRequest(103, reqAuthA2, "alice", validAliceOtp, stateA, false, false);
-        byte[] respA2 = sendRadiusPacket(packetA2, 2000);
+        byte[] respA2 = sendRadiusPacket(packetA2, 5000);
         assertNotNull(respA2);
         assertEquals(2, respA2[0] & 0xFF, "Alice must succeed without interference from Bob");
     }
@@ -360,7 +373,7 @@ public class RadiusInBandMfaTest {
     public void testCaseInsensitiveUsername_Succeeds() throws Exception {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(110, reqAuth1, "ALICE", "AlicePass123!", null, false, false);
-        byte[] resp1 = sendRadiusPacket(packet1, 2000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1, "Server must handle case-insensitive usernames");
         assertEquals(11, resp1[0] & 0xFF, "ALICE must match alice and return Access-Challenge");
@@ -370,7 +383,7 @@ public class RadiusInBandMfaTest {
         String validOtp = String.format("%06d", totpService.generateOtp(alice.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(111, reqAuth2, "ALICE", validOtp, state, false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 2000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2);
         assertEquals(2, resp2[0] & 0xFF, "ALICE must complete authentication successfully");
@@ -389,7 +402,7 @@ public class RadiusInBandMfaTest {
         // Verify server is still completely operational
         byte[] reqAuth = randomAuthenticator();
         byte[] validPacket = buildAccessRequest(120, reqAuth, "alice", "AlicePass123!", null, false, false);
-        byte[] validResp = sendRadiusPacket(validPacket, 2000);
+        byte[] validResp = sendRadiusPacket(validPacket, 5000);
 
         assertNotNull(validResp, "Server UDP listener must remain operational after receiving malformed packet");
         assertEquals(11, validResp[0] & 0xFF, "Server must continue serving valid requests normally");

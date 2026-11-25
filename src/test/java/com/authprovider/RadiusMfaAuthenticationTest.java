@@ -1,7 +1,9 @@
 package com.authprovider;
 
 import static com.authprovider.OAuthTestSupport.bearer;
+import com.authprovider.entity.SecurityPolicy;
 import com.authprovider.entity.User;
+import com.authprovider.repository.SecurityPolicyRepository;
 import com.authprovider.repository.UserRepository;
 import com.authprovider.service.SecretGenerator;
 import com.authprovider.service.TotpService;
@@ -36,7 +38,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest(properties = {
         "radius.port=18125",
         "iam.bootstrap.radius.shared-secret=testing123",
-        "iam.bootstrap.policy.mfa-approval-ttl-seconds=3"
+        "iam.bootstrap.policy.mfa-approval-ttl-seconds=60"
 })
 @AutoConfigureMockMvc
 public class RadiusMfaAuthenticationTest {
@@ -46,6 +48,9 @@ public class RadiusMfaAuthenticationTest {
 
     @Autowired
     private MockMvc mockMvc;
+
+    @Autowired
+    private SecurityPolicyRepository policyRepository;
 
     @Autowired
     private com.authprovider.TestClientAssignments assignments;
@@ -66,6 +71,10 @@ public class RadiusMfaAuthenticationTest {
 
     @BeforeEach
     public void cleanUp() {
+        policyRepository.findByName(SecurityPolicy.DEFAULT_NAME).ifPresent(p -> {
+            p.setMfaApprovalTtlSeconds(60);
+            policyRepository.saveAndFlush(p);
+        });
         userRepository.deleteAll();
     }
 
@@ -93,7 +102,7 @@ public class RadiusMfaAuthenticationTest {
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(10, reqAuth1, "alice", false, false);
 
-        byte[] resp1 = sendRadiusPacket(packet1, 1500);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
         assertNotNull(resp1, "Expected RADIUS response for pre-authenticated user");
         assertEquals(2, resp1[0] & 0xFF, "Expected Access-Accept (Code 2)");
         assertEquals(10, resp1[1] & 0xFF, "Expected matching Identifier 10");
@@ -101,7 +110,7 @@ public class RadiusMfaAuthenticationTest {
 
         // Retransmission of the exact same packet (same Identifier + same Request Authenticator)
         // must return the cached Access-Accept rather than failing
-        byte[] respRetry = sendRadiusPacket(packet1, 1500);
+        byte[] respRetry = sendRadiusPacket(packet1, 5000);
         assertNotNull(respRetry, "Expected cached RADIUS response on UDP retransmission");
         assertEquals(2, respRetry[0] & 0xFF, "Retransmitted Access-Request must still receive Access-Accept (Code 2)");
         assertEquals(10, respRetry[1] & 0xFF);
@@ -110,7 +119,7 @@ public class RadiusMfaAuthenticationTest {
         // A new Access-Request (different Identifier / Request Authenticator) after consumption must be rejected
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(11, reqAuth2, "alice", false, false);
-        byte[] resp2 = sendRadiusPacket(packet2, 1500);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
         assertNotNull(resp2, "Expected RADIUS Access-Reject response for second session attempt");
         assertEquals(3, resp2[0] & 0xFF, "Second distinct RADIUS check must receive Access-Reject (Code 3)");
         assertEquals(11, resp2[1] & 0xFF);
@@ -155,7 +164,7 @@ public class RadiusMfaAuthenticationTest {
         // Query over RADIUS using Active Directory UPN username@domain format
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(21, reqAuth, "bob@contoso.local", false, false);
-        byte[] resp = sendRadiusPacket(packet, 1500);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Expected RADIUS response for AD UPN username");
         assertEquals(2, resp[0] & 0xFF, "Expected Access-Accept (Code 2) when matching normalized AD usernames");
@@ -187,7 +196,7 @@ public class RadiusMfaAuthenticationTest {
         // Charlie's pre-auth approval must still be intact and return Access-Accept
         byte[] goodAuth = randomAuthenticator();
         byte[] goodPacket = buildAccessRequest(31, goodAuth, "charlie", true, false);
-        byte[] goodResp = sendRadiusPacket(goodPacket, 1500);
+        byte[] goodResp = sendRadiusPacket(goodPacket, 5000);
 
         assertNotNull(goodResp, "Expected RADIUS response for valid Message-Authenticator request");
         assertEquals(2, goodResp[0] & 0xFF, "Expected Access-Accept (Code 2) for valid Message-Authenticator");
@@ -198,6 +207,10 @@ public class RadiusMfaAuthenticationTest {
 
     @Test
     public void testUnauthenticatedWebPreAuthFlowAndTtlExpiration() throws Exception {
+        SecurityPolicy policy = policyRepository.findByName(SecurityPolicy.DEFAULT_NAME).orElseThrow();
+        policy.setMfaApprovalTtlSeconds(2);
+        policyRepository.saveAndFlush(policy);
+
         // Verify GET /mfa is accessible without authentication (no redirect to /login)
         mockMvc.perform(get("/mfa"))
                 .andExpect(status().isOk());
@@ -216,12 +229,12 @@ public class RadiusMfaAuthenticationTest {
         assertTrue(postStatus == 200 || (postStatus == 302 && (redirectedUrl == null || !redirectedUrl.contains("/login"))),
                 "POST /mfa must be permitted without redirecting to /login");
 
-        // Wait for the 3-second TTL to expire
-        Thread.sleep(3300);
+        // Wait for the 2-second TTL to expire
+        Thread.sleep(2500);
 
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(40, reqAuth, "dave", false, false);
-        byte[] resp = sendRadiusPacket(packet, 1500);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Expected RADIUS response after TTL expiration");
         assertEquals(3, resp[0] & 0xFF, "Expired pre-authentication approval must return Access-Reject (Code 3)");

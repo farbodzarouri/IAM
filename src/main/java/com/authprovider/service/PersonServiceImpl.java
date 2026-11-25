@@ -16,6 +16,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -318,13 +319,13 @@ public class PersonServiceImpl implements PersonService {
         if (transactionTemplate == null || TransactionSynchronizationManager.isActualTransactionActive()) {
             try {
                 return work.get();
-            } catch (DataIntegrityViolationException | OptimisticLockingFailureException e) {
+            } catch (DataIntegrityViolationException | OptimisticLockingFailureException | PessimisticLockingFailureException e) {
                 throw new ConflictException("Person profile conflicts with an existing record");
             }
         }
         try {
             return transactionTemplate.execute(status -> work.get());
-        } catch (DataIntegrityViolationException | OptimisticLockingFailureException e) {
+        } catch (DataIntegrityViolationException | OptimisticLockingFailureException | PessimisticLockingFailureException e) {
             throw new ConflictException("Person profile conflicts with an existing record");
         }
     }

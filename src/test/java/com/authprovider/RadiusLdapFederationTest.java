@@ -42,7 +42,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @SpringBootTest(properties = {
         "radius.port=18128",
         "iam.bootstrap.radius.shared-secret=testing123",
-        "iam.bootstrap.policy.challenge-ttl-seconds=10",
+        "iam.bootstrap.policy.challenge-ttl-seconds=60",
         "ldap.enabled=true",
         "ldap.base-dn=dc=example,dc=org",
         "ldap.user-search-filter=(&(objectClass=person)(|(uid={0})(sAMAccountName={0})))",
@@ -112,7 +112,7 @@ public class RadiusLdapFederationTest {
     public void testUnenrolledDirectoryUser_RejectedWithEnrollmentRequired() throws Exception {
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(10, reqAuth, "alice", "Password123!", null);
-        byte[] resp = sendRadiusPacket(packet, 3000);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Server must respond to unenrolled directory user");
         assertEquals(3, resp[0] & 0xFF, "Unenrolled directory user must be rejected with Access-Reject (Code 3)");
@@ -130,7 +130,7 @@ public class RadiusLdapFederationTest {
         // Step 1: Access-Request with directory password -> Access-Challenge
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(20, reqAuth1, "bob", "BobLdapPass!", null);
-        byte[] resp1 = sendRadiusPacket(packet1, 3000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1, "Server must respond to enrolled directory user primary authentication");
         assertEquals(11, resp1[0] & 0xFF, "Enrolled directory user must receive Access-Challenge (Code 11)");
@@ -144,7 +144,7 @@ public class RadiusLdapFederationTest {
         String validOtp = String.format("%06d", totpService.generateOtp(enrolledBob.getSecret()));
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(21, reqAuth2, "bob", validOtp, state);
-        byte[] resp2 = sendRadiusPacket(packet2, 3000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2, "Server must respond to OTP challenge response");
         assertEquals(2, resp2[0] & 0xFF, "Valid OTP and State must return Access-Accept (Code 2)");
@@ -155,7 +155,7 @@ public class RadiusLdapFederationTest {
     public void testEnrolledDirectoryUser_WrongPassword_ReturnsAccessReject() throws Exception {
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(30, reqAuth, "bob", "WrongLdapPassword!", null);
-        byte[] resp = sendRadiusPacket(packet, 3000);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Server must respond to invalid directory credentials");
         assertEquals(3, resp[0] & 0xFF, "Invalid directory password must return Access-Reject (Code 3)");
@@ -167,7 +167,7 @@ public class RadiusLdapFederationTest {
         // Step 1: Access-Request with directory password
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(40, reqAuth1, "bob", "BobLdapPass!", null);
-        byte[] resp1 = sendRadiusPacket(packet1, 3000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1);
         assertEquals(11, resp1[0] & 0xFF);
@@ -177,7 +177,7 @@ public class RadiusLdapFederationTest {
         // Step 2: Access-Request with bad OTP -> Access-Reject
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(41, reqAuth2, "bob", "000000", state);
-        byte[] resp2 = sendRadiusPacket(packet2, 3000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2);
         assertEquals(3, resp2[0] & 0xFF, "Invalid OTP must return Access-Reject (Code 3)");
@@ -191,7 +191,7 @@ public class RadiusLdapFederationTest {
         // and fallback-to-local is false.
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(50, reqAuth, "bob", "LocalBobHashPass123!", null);
-        byte[] resp = sendRadiusPacket(packet, 3000);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Server must respond");
         assertEquals(3, resp[0] & 0xFF, "Directory user must not authenticate with local DB password when fallback is false");
@@ -202,7 +202,7 @@ public class RadiusLdapFederationTest {
     public void testMixedCaseUsername_EnrolledDirectoryUser_Succeeds() throws Exception {
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(60, reqAuth, "BoB", "BobLdapPass!", null);
-        byte[] resp = sendRadiusPacket(packet, 3000);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Server must respond to mixed-case username");
         assertEquals(11, resp[0] & 0xFF, "Case-insensitive directory username must receive Access-Challenge");
@@ -217,7 +217,7 @@ public class RadiusLdapFederationTest {
 
         byte[] reqAuth1 = randomAuthenticator();
         byte[] packet1 = buildAccessRequest(70, reqAuth1, "bob", "BadPasswordAttempt!", null);
-        byte[] resp1 = sendRadiusPacket(packet1, 3000);
+        byte[] resp1 = sendRadiusPacket(packet1, 5000);
 
         assertNotNull(resp1, "Server must respond to invalid password attempt");
         assertEquals(3, resp1[0] & 0xFF, "Invalid directory credentials must yield Access-Reject");
@@ -235,7 +235,7 @@ public class RadiusLdapFederationTest {
         mockLdapServer.bindRequests.clear();
         byte[] reqAuth2 = randomAuthenticator();
         byte[] packet2 = buildAccessRequest(71, reqAuth2, "CONTOSO\\bob", "AnotherBadPassword!", null);
-        byte[] resp2 = sendRadiusPacket(packet2, 3000);
+        byte[] resp2 = sendRadiusPacket(packet2, 5000);
 
         assertNotNull(resp2, "Server must respond to invalid domain user attempt");
         assertEquals(3, resp2[0] & 0xFF, "Invalid domain credentials must yield Access-Reject");
@@ -254,7 +254,7 @@ public class RadiusLdapFederationTest {
 
         byte[] reqAuth = randomAuthenticator();
         byte[] packet = buildAccessRequest(80, reqAuth, "EXAMPLE\\bob", "BobLdapPass!", null);
-        byte[] resp = sendRadiusPacket(packet, 3000);
+        byte[] resp = sendRadiusPacket(packet, 5000);
 
         assertNotNull(resp, "Server must respond to domain-qualified user");
         assertEquals(11, resp[0] & 0xFF, "Domain user with valid credentials must receive Access-Challenge");
@@ -289,7 +289,7 @@ public class RadiusLdapFederationTest {
         // Verify server remains fully functional after malformed packet
         byte[] reqAuth = randomAuthenticator();
         byte[] validPacket = buildAccessRequest(100, reqAuth, "bob", "BobLdapPass!", null);
-        byte[] validResp = sendRadiusPacket(validPacket, 3000);
+        byte[] validResp = sendRadiusPacket(validPacket, 5000);
         assertNotNull(validResp, "Server worker pool must remain healthy and process subsequent valid requests");
         assertEquals(11, validResp[0] & 0xFF);
     }

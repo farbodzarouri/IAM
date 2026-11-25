@@ -18,6 +18,7 @@ import com.authprovider.repository.UserRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -62,14 +63,38 @@ public class RegistrationServiceImpl implements RegistrationService {
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
+    private record TxResult(Person person,
+                            User savedUser,
+                            OtpToken token,
+                            boolean newlyProvisioned,
+                            List<ClientAssignmentResponse> radiusResponses,
+                            List<ClientAssignmentResponse> oauthResponses) {
+    }
+
     @Override
     public UserRegistrationResponse registerUser(UserRegistrationRequest request) {
         validateRequest(request);
+        String rawPassword = (request.getPassword() == null || request.getPassword().isBlank())
+                ? null : request.getPassword();
+        String encodedPassword = rawPassword == null ? null : passwordService.encode(rawPassword);
+        TxResult tx;
         try {
-            return transactionTemplate.execute(status -> executeRegistration(request));
-        } catch (DataIntegrityViolationException | OptimisticLockingFailureException e) {
+            tx = transactionTemplate.execute(status -> executeRegistration(request, rawPassword, encodedPassword));
+        } catch (DataIntegrityViolationException | OptimisticLockingFailureException | PessimisticLockingFailureException e) {
             throw new ConflictException("Registration conflicts with an existing user or person");
         }
+        UserRegistrationResponse.ProvisionedTokenInfo tokenInfo =
+                buildTokenInfo(tx.person(), tx.token(), tx.newlyProvisioned());
+
+        log.info("Registered user '{}' (id={}) linked to person id {} (otpTokenId={})",
+                tx.savedUser().getUsername(), tx.savedUser().getId(), tx.person().getId(),
+                tx.token() == null ? null : tx.token().getId());
+
+        return UserRegistrationResponse.builder()
+                .person(PersonResponse.from(tx.person()))
+                .user(UserResponse.from(tx.savedUser(), tx.radiusResponses(), tx.oauthResponses()))
+                .otpToken(tokenInfo)
+                .build();
     }
 
     private void validateRequest(UserRegistrationRequest request) {
@@ -90,7 +115,7 @@ public class RegistrationServiceImpl implements RegistrationService {
         }
     }
 
-    private UserRegistrationResponse executeRegistration(UserRegistrationRequest request) {
+    private TxResult executeRegistration(UserRegistrationRequest request, String rawPassword, String encodedPassword) {
         String username = request.getUsername().trim();
         if (!userRepository.findAllByUsernameIgnoreCase(username).isEmpty()) {
             throw new ConflictException("Username already exists: " + username);
@@ -98,8 +123,6 @@ public class RegistrationServiceImpl implements RegistrationService {
 
         Person person = resolveOrCreatePerson(request);
 
-        String rawPassword = (request.getPassword() == null || request.getPassword().isBlank())
-                ? null : request.getPassword();
         validateAdminCredentialSeparation(person.getId(), username, rawPassword);
 
         TokenResolution resolvedToken = resolveOrCreateOtpToken(request, person, username);
@@ -107,7 +130,7 @@ public class RegistrationServiceImpl implements RegistrationService {
 
         User savedUser = userRepository.saveAndFlush(User.builder()
                 .username(username)
-                .password(rawPassword == null ? null : passwordService.encode(rawPassword))
+                .password(encodedPassword)
                 .person(person)
                 .otpToken(token)
                 .enabled(request.getEnabled() == null || request.getEnabled())
@@ -124,17 +147,7 @@ public class RegistrationServiceImpl implements RegistrationService {
                 : assignmentService.getOAuthAssignments(savedUser.getId()).stream()
                         .map(ClientAssignmentResponse::from).toList();
 
-        UserRegistrationResponse.ProvisionedTokenInfo tokenInfo =
-                buildTokenInfo(person, token, resolvedToken.newlyProvisioned());
-
-        log.info("Registered user '{}' (id={}) linked to person id {} (otpTokenId={})",
-                savedUser.getUsername(), savedUser.getId(), person.getId(), token == null ? null : token.getId());
-
-        return UserRegistrationResponse.builder()
-                .person(PersonResponse.from(person))
-                .user(UserResponse.from(savedUser, radiusResponses, oauthResponses))
-                .otpToken(tokenInfo)
-                .build();
+        return new TxResult(person, savedUser, token, resolvedToken.newlyProvisioned(), radiusResponses, oauthResponses);
     }
 
     private Person resolveOrCreatePerson(UserRegistrationRequest request) {
